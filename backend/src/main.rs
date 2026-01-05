@@ -20,12 +20,14 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tokio::task::JoinSet;
 use tokio::{
     io,
     net::{TcpListener, TcpStream},
     task::JoinHandle,
+    time,
 };
 use tokio_util::sync::CancellationToken;
 use tower_http::{
@@ -51,6 +53,8 @@ struct Upstream {
     name: String,
     address: String,
     enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    healthy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,13 +90,15 @@ struct AppContext {
     store: RwLock<ConfigStore>,
     supervisor: BalancerSupervisor,
     state_path: PathBuf,
+    health: Arc<RwLock<HashMap<Uuid, bool>>>,
 }
 
 type AppState = Arc<AppContext>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct BalancerSupervisor {
     tasks: Arc<RwLock<HashMap<Uuid, BalancerHandle>>>,
+    health: Arc<RwLock<HashMap<Uuid, bool>>>,
 }
 
 struct BalancerHandle {
@@ -143,18 +149,24 @@ async fn main() -> anyhow::Result<()> {
 
     let state_path = resolve_state_path();
     let initial_store = load_store(&state_path).unwrap_or_default();
-    let supervisor = BalancerSupervisor::default();
+    let health_map = Arc::new(RwLock::new(HashMap::new()));
+    let supervisor = BalancerSupervisor {
+        tasks: Arc::new(RwLock::new(HashMap::new())),
+        health: health_map.clone(),
+    };
 
     let state: AppState = Arc::new(AppContext {
         store: RwLock::new(initial_store),
         supervisor,
         state_path,
+        health: health_map.clone(),
     });
 
     let admin_dist = resolve_admin_dist();
     let admin_index = admin_dist.join("index.html");
 
     hydrate_supervisor(state.clone()).await?;
+    spawn_health_monitor(state.clone());
 
     let api = Router::new()
         .route("/health", get(health))
@@ -218,7 +230,13 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
 
 async fn list_listeners(State(state): State<AppState>) -> Json<Vec<ListenerConfig>> {
     let store = state.store.read();
-    Json(store.listeners.values().cloned().collect())
+    let list = store
+        .listeners
+        .values()
+        .cloned()
+        .map(|cfg| with_health(&state, cfg))
+        .collect();
+    Json(list)
 }
 
 async fn get_listener(
@@ -229,7 +247,7 @@ async fn get_listener(
     let Some(listener) = store.listeners.get(&id) else {
         return Err(ApiError::NotFound);
     };
-    Ok(Json(listener.clone()))
+    Ok(Json(with_health(&state, listener.clone())))
 }
 
 #[axum::debug_handler]
@@ -334,6 +352,7 @@ impl UpstreamPayload {
             name: self.name,
             address: self.address,
             enabled: self.enabled,
+            healthy: None,
         })
     }
 }
@@ -349,7 +368,7 @@ impl BalancerSupervisor {
     async fn upsert(&self, config: ListenerConfig) -> anyhow::Result<()> {
         let id = config.id;
         self.remove(&config.id).await;
-        let handle = spawn_listener(config).await?;
+        let handle = spawn_listener(config, self.health.clone()).await?;
         self.tasks.write().insert(id, handle);
         Ok(())
     }
@@ -373,7 +392,10 @@ impl BalancerSupervisor {
     }
 }
 
-async fn spawn_listener(config: ListenerConfig) -> anyhow::Result<BalancerHandle> {
+async fn spawn_listener(
+    config: ListenerConfig,
+    health: Arc<RwLock<HashMap<Uuid, bool>>>,
+) -> anyhow::Result<BalancerHandle> {
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
     let protocol_for_task = config.protocol.clone();
@@ -381,8 +403,8 @@ async fn spawn_listener(config: ListenerConfig) -> anyhow::Result<BalancerHandle
 
     let join = tokio::spawn(async move {
         let result = match protocol_for_task {
-            Protocol::Http => run_http_listener(config, cancel_for_task).await,
-            Protocol::Tcp => run_tcp_listener(config, cancel_for_task).await,
+            Protocol::Http => run_http_listener(config, cancel_for_task, health).await,
+            Protocol::Tcp => run_tcp_listener(config, cancel_for_task, health).await,
         };
 
         if let Err(err) = result {
@@ -398,22 +420,25 @@ struct HttpProxyState {
     upstreams: Arc<Vec<Upstream>>,
     position: Arc<AtomicUsize>,
     client: reqwest::Client,
+    health: Arc<RwLock<HashMap<Uuid, bool>>>,
 }
 
 impl HttpProxyState {
-    fn new(upstreams: Vec<Upstream>) -> Self {
+    fn new(upstreams: Vec<Upstream>, health: Arc<RwLock<HashMap<Uuid, bool>>>) -> Self {
         Self {
             upstreams: Arc::new(upstreams),
             position: Arc::new(AtomicUsize::new(0)),
             client: reqwest::Client::new(),
+            health,
         }
     }
 
     fn next_upstream(&self) -> Option<Upstream> {
+        let health = self.health.read();
         let enabled: Vec<_> = self
             .upstreams
             .iter()
-            .filter(|u| u.enabled)
+            .filter(|u| u.enabled && *health.get(&u.id).unwrap_or(&true))
             .cloned()
             .collect();
         if enabled.is_empty() {
@@ -428,9 +453,10 @@ impl HttpProxyState {
 async fn run_http_listener(
     config: ListenerConfig,
     cancel: CancellationToken,
+    health: Arc<RwLock<HashMap<Uuid, bool>>>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config.listen.parse()?;
-    let state = HttpProxyState::new(config.upstreams.clone());
+    let state = HttpProxyState::new(config.upstreams.clone(), health);
 
     let router = Router::new().fallback(proxy_http).with_state(state);
     info!(
@@ -452,7 +478,11 @@ async fn run_http_listener(
     Ok(())
 }
 
-async fn run_tcp_listener(config: ListenerConfig, cancel: CancellationToken) -> anyhow::Result<()> {
+async fn run_tcp_listener(
+    config: ListenerConfig,
+    cancel: CancellationToken,
+    health: Arc<RwLock<HashMap<Uuid, bool>>>,
+) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config.listen.parse()?;
     let upstreams: Arc<Vec<_>> =
         Arc::new(config.upstreams.into_iter().filter(|u| u.enabled).collect());
@@ -479,7 +509,7 @@ async fn run_tcp_listener(config: ListenerConfig, cancel: CancellationToken) -> 
             }
         };
 
-        let Some(upstream) = pick_round_robin(&upstreams, &cursor) else {
+        let Some(upstream) = pick_round_robin(&upstreams, &cursor, &health) else {
             warn!(
                 "No enabled upstreams for {}, closing connection from {}",
                 config.name, peer
@@ -501,12 +531,22 @@ async fn run_tcp_listener(config: ListenerConfig, cancel: CancellationToken) -> 
     Ok(())
 }
 
-fn pick_round_robin(upstreams: &Arc<Vec<Upstream>>, cursor: &Arc<AtomicUsize>) -> Option<Upstream> {
-    if upstreams.is_empty() {
+fn pick_round_robin(
+    upstreams: &Arc<Vec<Upstream>>,
+    cursor: &Arc<AtomicUsize>,
+    health: &Arc<RwLock<HashMap<Uuid, bool>>>,
+) -> Option<Upstream> {
+    let health_map = health.read();
+    let active: Vec<_> = upstreams
+        .iter()
+        .filter(|u| *health_map.get(&u.id).unwrap_or(&true))
+        .cloned()
+        .collect();
+    if active.is_empty() {
         return None;
     }
-    let idx = cursor.fetch_add(1, Ordering::Relaxed) % upstreams.len();
-    upstreams.get(idx).cloned()
+    let idx = cursor.fetch_add(1, Ordering::Relaxed) % active.len();
+    active.get(idx).cloned()
 }
 
 async fn proxy_http(
@@ -638,4 +678,66 @@ async fn hydrate_supervisor(state: AppState) -> anyhow::Result<()> {
     }
     while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+fn with_health(state: &AppState, mut cfg: ListenerConfig) -> ListenerConfig {
+    let health = state.health.read();
+    for upstream in cfg.upstreams.iter_mut() {
+        upstream.healthy = Some(*health.get(&upstream.id).unwrap_or(&false));
+    }
+    cfg
+}
+
+fn spawn_health_monitor(state: AppState) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        run_health_cycle(&state, &client).await;
+        let mut interval = time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            run_health_cycle(&state, &client).await;
+        }
+    });
+}
+
+async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
+    let listeners: Vec<ListenerConfig> = {
+        let store = state.store.read();
+        store.listeners.values().cloned().collect()
+    };
+
+    for listener in listeners {
+        for upstream in listener.upstreams {
+            let ok = match listener.protocol {
+                Protocol::Http => check_http(client, &upstream.address).await,
+                Protocol::Tcp => check_tcp(&upstream.address).await,
+            };
+            state.health.write().insert(upstream.id, ok);
+        }
+    }
+}
+
+async fn check_http(client: &reqwest::Client, url: &str) -> bool {
+    let fut = client.get(url).timeout(Duration::from_secs(2)).send();
+    match fut.await {
+        Ok(resp) => resp.status().is_success(),
+        Err(err) => {
+            warn!("HTTP health check failed for {url}: {err}");
+            false
+        }
+    }
+}
+
+async fn check_tcp(addr: &str) -> bool {
+    match time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(err)) => {
+            warn!("TCP health check failed for {addr}: {err}");
+            false
+        }
+        Err(_) => {
+            warn!("TCP health check timed out for {addr}");
+            false
+        }
+    }
 }

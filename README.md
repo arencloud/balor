@@ -57,6 +57,7 @@ cargo run -p backend
 Environment knobs:
 - `BALOR_HTTP_ADDR` (default `0.0.0.0:8080`) – admin API + UI bind address.
 - `BALOR_ADMIN_DIST` (default `admin/dist`) – path where the Yew assets are served from.
+- `BALOR_STATE_FILE` (default `data/balor_state.json`) – persisted listener config storage.
 
 ## API sketch
 - `GET /api/health` – service heartbeat.
@@ -69,5 +70,6 @@ Environment knobs:
 
 ## Notes
 - HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port.
-- State is in-memory for now; persistence and health checks can be layered on later.
+- State persists to `data/balor_state.json` on each change (path override via `BALOR_STATE_FILE`).
+- Background health checks run every ~5 seconds and mark upstreams up/down in the UI automatically.
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.

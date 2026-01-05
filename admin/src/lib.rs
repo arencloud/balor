@@ -23,6 +23,8 @@ struct Upstream {
     name: String,
     address: String,
     enabled: bool,
+    #[serde(default)]
+    healthy: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -371,8 +373,17 @@ fn render_listener(
                 </div>
             </div>
             <div class="pill-row">
-                { for listener.upstreams.iter().map(|u| html!{
-                    <span class={classes!("pill", if u.enabled {"pill-on"} else {"pill-off"})}>{format!("{} • {}", u.name, u.address)}</span>
+                { for listener.upstreams.iter().map(|u| {
+                    let (status, class) = match u.healthy {
+                        Some(true) => ("up", "pill pill-on"),
+                        Some(false) => ("down", "pill pill-error"),
+                        None => ("unknown", "pill pill-ghost"),
+                    };
+                    html!{
+                        <span class={classes!(class)}>
+                            {format!("{} • {} • {}", u.name, u.address, status)}
+                        </span>
+                    }
                 })}
             </div>
         </article>
