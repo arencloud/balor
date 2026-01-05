@@ -5,6 +5,7 @@
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::spawn_local;
@@ -22,6 +23,21 @@ enum Protocol {
 enum StickyStrategy {
     Cookie,
     IpHash,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Role {
+    Admin,
+    Operator,
+    Viewer,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct Session {
+    token: String,
+    username: String,
+    role: Role,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -79,6 +95,20 @@ struct ListenerPayload {
     sticky: Option<StickyConfig>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct User {
+    id: Uuid,
+    username: String,
+    role: Role,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct UserPayload {
+    username: String,
+    role: Role,
+    password: String,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 struct Stats {
     listener_count: usize,
@@ -99,29 +129,42 @@ fn app() -> Html {
     let loading = use_state(|| false);
     let editing = use_state(|| None::<Uuid>);
     let stats = use_state(Stats::default);
-    let auth_token = use_state(load_token);
+    let session = use_state(load_session);
+    let tab = use_state(|| Tab::Listeners);
+    let users = use_state(Vec::<User>::new);
+    let user_form = use_state(UserForm::default);
+    let login_form = use_state(LoginForm::default);
 
     {
         let listeners = listeners.clone();
         let stats = stats.clone();
         let status = status.clone();
         let loading = loading.clone();
-        use_effect_with((), move |_| {
-            loading.set(true);
-            spawn_local(async move {
-                match api_listeners().await {
-                    Ok(items) => {
-                        listeners.set(items);
-                        status.set(StatusLine::clear());
+        let session = session.clone();
+        let users = users.clone();
+        use_effect_with((*session).clone(), move |current: &Option<Session>| {
+            if let Some(session) = current.clone() {
+                loading.set(true);
+                spawn_local(async move {
+                    match api_listeners().await {
+                        Ok(items) => {
+                            listeners.set(items);
+                            status.set(StatusLine::clear());
+                        }
+                        Err(err) => status.set(StatusLine::error(err)),
                     }
-                    Err(err) => status.set(StatusLine::error(err)),
-                }
-                match api_stats().await {
-                    Ok(s) => stats.set(s),
-                    Err(err) => status.set(StatusLine::error(err)),
-                }
-                loading.set(false);
-            });
+                    match api_stats().await {
+                        Ok(s) => stats.set(s),
+                        Err(err) => status.set(StatusLine::error(err)),
+                    }
+                    if session.role == Role::Admin {
+                        if let Ok(u) = api_users().await {
+                            users.set(u);
+                        }
+                    }
+                    loading.set(false);
+                });
+            }
             || ()
         });
     }
@@ -130,25 +173,115 @@ fn app() -> Html {
         let listeners = listeners.clone();
         let stats = stats.clone();
         let status = status.clone();
-        use_effect_with((), move |_| {
-            let interval = Interval::new(5000, move || {
+        let users = users.clone();
+        use_effect_with((*session).clone(), move |current: &Option<Session>| {
+            let current = current.clone();
+            let interval = current.as_ref().map(|sess| {
                 let listeners = listeners.clone();
                 let stats = stats.clone();
                 let status = status.clone();
-                spawn_local(async move {
-                    match api_listeners().await {
-                        Ok(items) => listeners.set(items),
-                        Err(err) => status.set(StatusLine::error(err)),
-                    }
-                    match api_stats().await {
-                        Ok(s) => stats.set(s),
-                        Err(err) => status.set(StatusLine::error(err)),
-                    }
-                });
+                let users = users.clone();
+                let session_clone = Some(sess.clone());
+                Interval::new(5000, move || {
+                    let listeners = listeners.clone();
+                    let stats = stats.clone();
+                    let status = status.clone();
+                    let users = users.clone();
+                    let session_clone = session_clone.clone();
+                    spawn_local(async move {
+                        match api_listeners().await {
+                            Ok(items) => listeners.set(items),
+                            Err(err) => status.set(StatusLine::error(err)),
+                        }
+                        match api_stats().await {
+                            Ok(s) => stats.set(s),
+                            Err(err) => status.set(StatusLine::error(err)),
+                        }
+                        if let Some(session) = session_clone {
+                            if session.role == Role::Admin {
+                                if let Ok(u) = api_users().await {
+                                    users.set(u);
+                                }
+                            }
+                        }
+                    });
+                })
             });
-            move || drop(interval)
+            move || {
+                if let Some(interval) = interval {
+                    drop(interval);
+                }
+            }
         });
     }
+
+    let on_login = {
+        let login_form = login_form.clone();
+        let session = session.clone();
+        let status = status.clone();
+        let listeners = listeners.clone();
+        let stats = stats.clone();
+        let users = users.clone();
+        let tab = tab.clone();
+        Callback::from(move |event: SubmitEvent| {
+            event.prevent_default();
+            let creds = (*login_form).clone();
+            let session = session.clone();
+            let status = status.clone();
+            let listeners = listeners.clone();
+            let stats = stats.clone();
+            let users = users.clone();
+            let tab = tab.clone();
+            spawn_local(async move {
+                match api_login(creds.username, creds.password).await {
+                    Ok(sess) => {
+                        save_session(&sess);
+                        session.set(Some(sess.clone()));
+                        tab.set(Tab::Listeners);
+                        if let Ok(items) = api_listeners().await {
+                            listeners.set(items);
+                        }
+                        if let Ok(s) = api_stats().await {
+                            stats.set(s);
+                        }
+                        if sess.role == Role::Admin {
+                            if let Ok(u) = api_users().await {
+                                users.set(u);
+                            }
+                        }
+                        status.set(StatusLine::success("Logged in"));
+                    }
+                    Err(err) => status.set(StatusLine::error(err)),
+                }
+            });
+        })
+    };
+
+    let on_logout = {
+        let session = session.clone();
+        let status = status.clone();
+        let listeners = listeners.clone();
+        let users = users.clone();
+        let stats = stats.clone();
+        Callback::from(move |_| {
+            let session = session.clone();
+            let status = status.clone();
+            let listeners = listeners.clone();
+            let users = users.clone();
+            let stats = stats.clone();
+            spawn_local(async move {
+                if let Some(sess) = (*session).clone() {
+                    let _ = api_logout(&sess.token).await;
+                }
+                clear_session_storage();
+                session.set(None);
+                listeners.set(vec![]);
+                users.set(vec![]);
+                stats.set(Stats::default());
+                status.set(StatusLine::success("Logged out"));
+            });
+        })
+    };
 
     let on_submit = {
         let form = form.clone();
@@ -199,6 +332,67 @@ fn app() -> Html {
         })
     };
 
+    if session.is_none() {
+        return html! {
+            <div class="page">
+                <header class="hero">
+                    <div class="brand">
+                        <img src="assets/balor.png" alt="Balor logo" class="logo" />
+                        <div>
+                            <p class="eyebrow">{"Load Balancer L4-L7"}</p>
+                            <h1>{"Balor Control"}</h1>
+                        </div>
+                    </div>
+                    <div class="meta">
+                        <div class="pill">{"Please sign in"}</div>
+                    </div>
+                </header>
+                <main class="content">
+                    <section class="panel">
+                        <h2>{"Login"}</h2>
+                        <form class="form-grid" onsubmit={on_login.clone()}>
+                            <label class="field">
+                                <span>{"Username"}</span>
+                                <input
+                                    value={login_form.username.clone()}
+                                    oninput={{
+                                        let login_form = login_form.clone();
+                                        Callback::from(move |e: InputEvent| {
+                                            let mut next = (*login_form).clone();
+                                            next.username = event_value(&e);
+                                            login_form.set(next);
+                                        })
+                                    }}
+                                    placeholder="admin"
+                                />
+                            </label>
+                            <label class="field">
+                                <span>{"Password"}</span>
+                                <input
+                                    r#type="password"
+                                    value={login_form.password.clone()}
+                                    oninput={{
+                                        let login_form = login_form.clone();
+                                        Callback::from(move |e: InputEvent| {
+                                            let mut next = (*login_form).clone();
+                                            next.password = event_value(&e);
+                                            login_form.set(next);
+                                        })
+                                    }}
+                                    placeholder="•••••••"
+                                />
+                            </label>
+                            <div class="actions">
+                                <button class="primary" type="submit">{"Login"}</button>
+                                <StatusBadge status={(*status).clone()} />
+                            </div>
+                        </form>
+                    </section>
+                </main>
+            </div>
+        };
+    }
+
     let on_delete = {
         let listeners = listeners.clone();
         let status = status.clone();
@@ -217,6 +411,8 @@ fn app() -> Html {
         })
     };
 
+    let current_session = session.as_ref().cloned().unwrap();
+
     html! {
         <div class="page">
             <header class="hero">
@@ -228,42 +424,23 @@ fn app() -> Html {
                     </div>
                 </div>
                 <div class="meta">
-                    <div class="pill">{"Rust + WASM UI"}</div>
-                    <div class="pill pill-glow">{"Round robin HTTP/TCP"}</div>
-                    <div class="auth">
-                        <input
-                            type="password"
-                            value={auth_token.as_ref().cloned().unwrap_or_default()}
-                            oninput={{
-                                let auth_token = auth_token.clone();
-                                Callback::from(move |e: InputEvent| {
-                                    auth_token.set(Some(event_value(&e)));
-                                })
-                            }}
-                            placeholder="Admin token"
-                        />
-                        <button class="ghost" type="button" onclick={{
-                            let auth_token = auth_token.clone();
-                            let status = status.clone();
-                            Callback::from(move |_| {
-                                if let Some(token) = auth_token.as_ref() {
-                                    save_token(token);
-                                    status.set(StatusLine::success("Saved token"));
-                                } else {
-                                    clear_token();
-                                    status.set(StatusLine::success("Cleared token"));
+                    <div class="pill-row">
+                        <button class={classes!("ghost", if *tab == Tab::Listeners { "pill-on" } else { "" })} onclick={{
+                            let tab = tab.clone();
+                            Callback::from(move |_| tab.set(Tab::Listeners))
+                        }}>{"Listeners"}</button>
+                        {
+                            if current_session.role == Role::Admin {
+                                let tab = tab.clone();
+                                html!{
+                                    <button class={classes!("ghost", if *tab == Tab::Users { "pill-on" } else { "" })} onclick={Callback::from(move |_| tab.set(Tab::Users))}>{"Users"}</button>
                                 }
-                            })
-                        }}>{"Save"}</button>
-                        <button class="ghost" type="button" onclick={{
-                            let auth_token = auth_token.clone();
-                            let status = status.clone();
-                            Callback::from(move |_| {
-                                auth_token.set(None);
-                                clear_token();
-                                status.set(StatusLine::success("Cleared token"));
-                            })
-                        }}>{"Clear"}</button>
+                            } else { html!{} }
+                        }
+                    </div>
+                    <div class="auth">
+                        <span class="pill">{format!("{} ({:?})", current_session.username, current_session.role)}</span>
+                        <button class="ghost" type="button" onclick={on_logout}>{"Logout"}</button>
                     </div>
                 </div>
             </header>
@@ -283,232 +460,367 @@ fn app() -> Html {
             </section>
 
             <main class="content">
-                <section class="panel">
-                    <h2>{"Create Listener"}</h2>
-                    <form class="form-grid" onsubmit={on_submit}>
-                        <label class="field">
-                            <span>{"Name"}</span>
-                            <input
-                                value={form.name.clone()}
-                                oninput={{
-                                    let form = form.clone();
-                                    Callback::from(move |e: InputEvent| {
-                                        let mut next = (*form).clone();
-                                        next.name = event_value(&e);
-                                        form.set(next);
-                                    })
-                                }}
-                                placeholder="Edge HTTP East"
-                            />
-                        </label>
-                        <label class="field">
-                            <span>{"Listen Address"}</span>
-                            <input
-                                value={form.listen.clone()}
-                                oninput={{
-                                    let form = form.clone();
-                                    Callback::from(move |e: InputEvent| {
-                                        let mut next = (*form).clone();
-                                        next.listen = event_value(&e);
-                                        form.set(next);
-                                    })
-                                }}
-                                placeholder="0.0.0.0:9000"
-                            />
-                        </label>
-                        <label class="field">
-                            <span>{"Protocol"}</span>
-                            <select
-                                onchange={{
-                                    let form = form.clone();
-                                    Callback::from(move |e: Event| {
-                                        let mut next = (*form).clone();
-                                        let target: web_sys::HtmlSelectElement = e.target_unchecked_into();
-                                        next.protocol = if target.value() == "tcp" { Protocol::Tcp } else { Protocol::Http };
-                                        if next.protocol == Protocol::Tcp {
-                                            next.tls_enabled = false;
-                                            next.cert_path.clear();
-                                            next.key_path.clear();
-                                            next.sticky = StickyMode::None;
-                                        }
-                                        form.set(next);
-                                    })
-                                }}
-                            >
-                                <option value="http" selected={form.protocol == Protocol::Http}>{"HTTP (L7)"}</option>
-                                <option value="tcp" selected={form.protocol == Protocol::Tcp}>{"TCP (L4)"}</option>
-                            </select>
-                        </label>
-                        <label class="field">
-                            <span>{"Session affinity"}</span>
-                            <select
-                                disabled={form.protocol == Protocol::Tcp}
-                                onchange={{
-                                    let form = form.clone();
-                                    Callback::from(move |e: Event| {
-                                        let mut next = (*form).clone();
-                                        let target: web_sys::HtmlSelectElement = e.target_unchecked_into();
-                                        next.sticky = match target.value().as_str() {
-                                            "cookie" => StickyMode::Cookie,
-                                            "ip_hash" => StickyMode::IpHash,
-                                            _ => StickyMode::None,
-                                        };
-                                        form.set(next);
-                                    })
-                                }}
-                            >
-                                <option value="none" selected={form.sticky == StickyMode::None}>{"None (round robin)"}</option>
-                                <option value="cookie" selected={form.sticky == StickyMode::Cookie}>{"Cookie (per upstream)"}</option>
-                                <option value="ip_hash" selected={form.sticky == StickyMode::IpHash}>{"Client IP hash"}</option>
-                            </select>
-                            <p class="hint">{"HTTP only. Cookie sets a sticky upstream id."}</p>
-                        </label>
-                        <label class="field span-2">
-                            <span>{"Upstreams (one per line, optional label via name=url)"}</span>
-                            <p class="hint">{"HTTP: include http(s)://. TCP: host:port."}</p>
-                            <textarea
-                                value={form.upstreams_text.clone()}
-                                oninput={{
-                                    let form = form.clone();
-                                    Callback::from(move |e: InputEvent| {
-                                        let mut next = (*form).clone();
-                                        next.upstreams_text = textarea_value(&e);
-                                        form.set(next);
-                                    })
-                                }}
-                                placeholder="api=http://127.0.0.1:7000\ntcp1=127.0.0.1:7001"
-                            />
-                        </label>
-                        {
-                            if form.protocol == Protocol::Http {
-                                html!{
-                                    <>
+                {
+                    if *tab == Tab::Listeners {
+                        html! {
+                            <>
+                                <section class="panel">
+                                    <h2>{"Create Listener"}</h2>
+                                    <form class="form-grid" onsubmit={on_submit}>
                                         <label class="field">
-                                            <span>{"TLS termination (PEM paths)"}</span>
-                                            <div class="inline">
-                                                <input
-                                                    type="checkbox"
-                                                    checked={form.tls_enabled}
-                                                    onchange={{
-                                                        let form = form.clone();
-                                                        Callback::from(move |e: Event| {
-                                                            let mut next = (*form).clone();
-                                                            next.tls_enabled = checkbox_checked(&e);
-                                                            form.set(next);
-                                                        })
-                                                    }}
-                                                />
-                                                <p class="hint">{"Enable Rustls with cert/key PEM files"}</p>
-                                            </div>
-                                        </label>
-                                        <label class="field">
-                                            <span>{"Certificate path"}</span>
+                                            <span>{"Name"}</span>
                                             <input
-                                                value={form.cert_path.clone()}
-                                                disabled={!form.tls_enabled}
+                                                value={form.name.clone()}
                                                 oninput={{
                                                     let form = form.clone();
                                                     Callback::from(move |e: InputEvent| {
                                                         let mut next = (*form).clone();
-                                                        next.cert_path = event_value(&e);
+                                                        next.name = event_value(&e);
                                                         form.set(next);
                                                     })
                                                 }}
-                                                placeholder="/etc/ssl/certs/balor.crt"
+                                                placeholder="Edge HTTP East"
                                             />
                                         </label>
                                         <label class="field">
-                                            <span>{"Private key path"}</span>
+                                            <span>{"Listen Address"}</span>
                                             <input
-                                                value={form.key_path.clone()}
-                                                disabled={!form.tls_enabled}
+                                                value={form.listen.clone()}
                                                 oninput={{
                                                     let form = form.clone();
                                                     Callback::from(move |e: InputEvent| {
                                                         let mut next = (*form).clone();
-                                                        next.key_path = event_value(&e);
+                                                        next.listen = event_value(&e);
                                                         form.set(next);
                                                     })
                                                 }}
-                                                placeholder="/etc/ssl/private/balor.key"
+                                                placeholder="0.0.0.0:9000"
+                                            />
+                                        </label>
+                                        <label class="field">
+                                            <span>{"Protocol"}</span>
+                                            <select
+                                                onchange={{
+                                                    let form = form.clone();
+                                                    Callback::from(move |e: Event| {
+                                                        let mut next = (*form).clone();
+                                                        let target: web_sys::HtmlSelectElement = e.target_unchecked_into();
+                                                        next.protocol = if target.value() == "tcp" { Protocol::Tcp } else { Protocol::Http };
+                                                        if next.protocol == Protocol::Tcp {
+                                                            next.tls_enabled = false;
+                                                            next.cert_path.clear();
+                                                            next.key_path.clear();
+                                                            next.sticky = StickyMode::None;
+                                                        }
+                                                        form.set(next);
+                                                    })
+                                                }}
+                                            >
+                                                <option value="http" selected={form.protocol == Protocol::Http}>{"HTTP (L7)"}</option>
+                                                <option value="tcp" selected={form.protocol == Protocol::Tcp}>{"TCP (L4)"}</option>
+                                            </select>
+                                        </label>
+                                        <label class="field">
+                                            <span>{"Session affinity"}</span>
+                                            <select
+                                                disabled={form.protocol == Protocol::Tcp}
+                                                onchange={{
+                                                    let form = form.clone();
+                                                    Callback::from(move |e: Event| {
+                                                        let mut next = (*form).clone();
+                                                        let target: web_sys::HtmlSelectElement = e.target_unchecked_into();
+                                                        next.sticky = match target.value().as_str() {
+                                                            "cookie" => StickyMode::Cookie,
+                                                            "ip_hash" => StickyMode::IpHash,
+                                                            _ => StickyMode::None,
+                                                        };
+                                                        form.set(next);
+                                                    })
+                                                }}
+                                            >
+                                                <option value="none" selected={form.sticky == StickyMode::None}>{"None (round robin)"}</option>
+                                                <option value="cookie" selected={form.sticky == StickyMode::Cookie}>{"Cookie (per upstream)"}</option>
+                                                <option value="ip_hash" selected={form.sticky == StickyMode::IpHash}>{"Client IP hash"}</option>
+                                            </select>
+                                            <p class="hint">{"HTTP only. Cookie sets a sticky upstream id."}</p>
+                                        </label>
+                                        <label class="field span-2">
+                                            <span>{"Upstreams (one per line, optional label via name=url)"}</span>
+                                            <p class="hint">{"HTTP: include http(s)://. TCP: host:port."}</p>
+                                            <textarea
+                                                value={form.upstreams_text.clone()}
+                                                oninput={{
+                                                    let form = form.clone();
+                                                    Callback::from(move |e: InputEvent| {
+                                                        let mut next = (*form).clone();
+                                                        next.upstreams_text = textarea_value(&e);
+                                                        form.set(next);
+                                                    })
+                                                }}
+                                                placeholder="api=http://127.0.0.1:7000\ntcp1=127.0.0.1:7001"
                                             />
                                         </label>
                                         {
-                                            if form.sticky == StickyMode::Cookie {
+                                            if form.protocol == Protocol::Http {
                                                 html!{
-                                                    <label class="field">
-                                                        <span>{"Sticky cookie name"}</span>
-                                                        <input
-                                                            value={form.cookie_name.clone()}
-                                                            oninput={{
-                                                                let form = form.clone();
-                                                                Callback::from(move |e: InputEvent| {
-                                                                    let mut next = (*form).clone();
-                                                                    next.cookie_name = event_value(&e);
-                                                                    form.set(next);
-                                                                })
-                                                            }}
-                                                            placeholder="BALOR_STICKY"
-                                                        />
-                                                    </label>
+                                                    <>
+                                                        <label class="field">
+                                                            <span>{"TLS termination (PEM paths)"}</span>
+                                                            <div class="inline">
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={form.tls_enabled}
+                                                                    onchange={{
+                                                                        let form = form.clone();
+                                                                        Callback::from(move |e: Event| {
+                                                                            let mut next = (*form).clone();
+                                                                            next.tls_enabled = checkbox_checked(&e);
+                                                                            form.set(next);
+                                                                        })
+                                                                    }}
+                                                                />
+                                                                <p class="hint">{"Enable Rustls with cert/key PEM files"}</p>
+                                                            </div>
+                                                        </label>
+                                                        <label class="field">
+                                                            <span>{"Certificate path"}</span>
+                                                            <input
+                                                                value={form.cert_path.clone()}
+                                                                disabled={!form.tls_enabled}
+                                                                oninput={{
+                                                                    let form = form.clone();
+                                                                    Callback::from(move |e: InputEvent| {
+                                                                        let mut next = (*form).clone();
+                                                                        next.cert_path = event_value(&e);
+                                                                        form.set(next);
+                                                                    })
+                                                                }}
+                                                                placeholder="/etc/ssl/certs/balor.crt"
+                                                            />
+                                                        </label>
+                                                        <label class="field">
+                                                            <span>{"Private key path"}</span>
+                                                            <input
+                                                                value={form.key_path.clone()}
+                                                                disabled={!form.tls_enabled}
+                                                                oninput={{
+                                                                    let form = form.clone();
+                                                                    Callback::from(move |e: InputEvent| {
+                                                                        let mut next = (*form).clone();
+                                                                        next.key_path = event_value(&e);
+                                                                        form.set(next);
+                                                                    })
+                                                                }}
+                                                                placeholder="/etc/ssl/private/balor.key"
+                                                            />
+                                                        </label>
+                                                        {
+                                                            if form.sticky == StickyMode::Cookie {
+                                                                html!{
+                                                                    <label class="field">
+                                                                        <span>{"Sticky cookie name"}</span>
+                                                                        <input
+                                                                            value={form.cookie_name.clone()}
+                                                                            oninput={{
+                                                                                let form = form.clone();
+                                                                                Callback::from(move |e: InputEvent| {
+                                                                                    let mut next = (*form).clone();
+                                                                                    next.cookie_name = event_value(&e);
+                                                                                    form.set(next);
+                                                                                })
+                                                                            }}
+                                                                            placeholder="BALOR_STICKY"
+                                                                        />
+                                                                    </label>
+                                                                }
+                                                            } else {
+                                                                html!{}
+                                                            }
+                                                        }
+                                                    </>
                                                 }
                                             } else {
                                                 html!{}
                                             }
                                         }
-                                    </>
-                                }
-                            } else {
-                                html!{}
-                            }
-                        }
-                        <div class="actions">
-                            <button class="primary" type="submit" disabled={*loading}>
-                                { if editing.is_some() { "Update listener" } else { "Save listener" } }
-                            </button>
-                            {
-                                if editing.is_some() {
-                                    let form = form.clone();
-                                    let editing = editing.clone();
-                                    let status = status.clone();
-                                    html!{
-                                        <button class="ghost" type="button" onclick={Callback::from(move |_| {
-                                            form.set(ListenerForm::default());
-                                            editing.set(None);
-                                            status.set(StatusLine::clear());
-                                        })}>{"Cancel edit"}</button>
-                                    }
-                                } else { html!{} }
-                            }
-                            <StatusBadge status={(*status).clone()} />
-                        </div>
-                    </form>
-                </section>
+                                        <div class="actions">
+                                            <button class="primary" type="submit" disabled={*loading}>
+                                                { if editing.is_some() { "Update listener" } else { "Save listener" } }
+                                            </button>
+                                            {
+                                                if editing.is_some() {
+                                                    let form = form.clone();
+                                                    let editing = editing.clone();
+                                                    let status = status.clone();
+                                                    html!{
+                                                        <button class="ghost" type="button" onclick={Callback::from(move |_| {
+                                                            form.set(ListenerForm::default());
+                                                            editing.set(None);
+                                                            status.set(StatusLine::clear());
+                                                        })}>{"Cancel edit"}</button>
+                                                    }
+                                                } else { html!{} }
+                                            }
+                                            <StatusBadge status={(*status).clone()} />
+                                        </div>
+                                    </form>
+                                </section>
 
-                <section class="panel">
-                    <div class="panel-head">
-                        <h2>{"Active Listeners"}</h2>
-                        { if *loading { html!{<span class="pill pill-ghost">{"Loading..."}</span>} } else { html!{} } }
-                    </div>
-                    {
-                        if listeners.is_empty() {
-                            html!{<p class="muted">{"No listeners yet. Add one above to start balancing traffic."}</p>}
-                        } else {
-                            html!{
-                                <div class="cards">
-                                    { for listeners.iter().map(|l| render_listener(l.clone(), on_delete.clone(), {
-                                        let form = form.clone();
-                                        let editing = editing.clone();
-                                        Callback::from(move |listener: Listener| {
-                                            form.set(ListenerForm::from_listener(&listener));
-                                            editing.set(Some(listener.id));
-                                        })
-                                    })) }
+                                <section class="panel">
+                                    <div class="panel-head">
+                                        <h2>{"Active Listeners"}</h2>
+                                        { if *loading { html!{<span class="pill pill-ghost">{"Loading..."}</span>} } else { html!{} } }
+                                    </div>
+                                    {
+                                        if listeners.is_empty() {
+                                            html!{<p class="muted">{"No listeners yet. Add one above to start balancing traffic."}</p>}
+                                        } else {
+                                            html!{
+                                                <div class="cards">
+                                                    { for listeners.iter().map(|l| render_listener(l.clone(), on_delete.clone(), {
+                                                        let form = form.clone();
+                                                        let editing = editing.clone();
+                                                        Callback::from(move |listener: Listener| {
+                                                            form.set(ListenerForm::from_listener(&listener));
+                                                            editing.set(Some(listener.id));
+                                                        })
+                                                    })) }
+                                                </div>
+                                            }
+                                        }
+                                    }
+                                </section>
+                            </>
+                        }
+                    } else {
+                        html! {
+                            <section class="panel">
+                                <div class="panel-head">
+                                    <h2>{"Users"}</h2>
+                                    <p class="muted">{"RBAC: Admin, Operator, Viewer"}</p>
                                 </div>
-                            }
+                                <form class="form-grid" onsubmit={{
+                                    let user_form = user_form.clone();
+                                    let users = users.clone();
+                                    let status = status.clone();
+                                    Callback::from(move |e: SubmitEvent| {
+                                        e.prevent_default();
+                                        let payload = match user_form.to_payload() {
+                                            Ok(p) => p,
+                                            Err(msg) => { status.set(StatusLine::error(msg)); return; }
+                                        };
+                                        let user_form = user_form.clone();
+                                        let users = users.clone();
+                                        let status = status.clone();
+                                        spawn_local(async move {
+                                            match api_create_user(payload).await {
+                                                Ok(user) => {
+                                                    let mut next = (*users).clone();
+                                                    next.push(user);
+                                                    users.set(next);
+                                                    user_form.set(UserForm::default());
+                                                    status.set(StatusLine::success("User created"));
+                                                }
+                                                Err(err) => status.set(StatusLine::error(err)),
+                                            }
+                                        });
+                                    })
+                                }}>
+                                    <label class="field">
+                                        <span>{"Username"}</span>
+                                        <input
+                                            value={user_form.username.clone()}
+                                            oninput={{
+                                                let user_form = user_form.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*user_form).clone();
+                                                    next.username = event_value(&e);
+                                                    user_form.set(next);
+                                                })
+                                            }}
+                                            placeholder="operator"
+                                        />
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Password"}</span>
+                                        <input
+                                            r#type="password"
+                                            value={user_form.password.clone()}
+                                            oninput={{
+                                                let user_form = user_form.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*user_form).clone();
+                                                    next.password = event_value(&e);
+                                                    user_form.set(next);
+                                                })
+                                            }}
+                                            placeholder="•••••••"
+                                        />
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Role"}</span>
+                                        <select onchange={{
+                                            let user_form = user_form.clone();
+                                            Callback::from(move |e: Event| {
+                                                let mut next = (*user_form).clone();
+                                                let target: web_sys::HtmlSelectElement = e.target_unchecked_into();
+                                                next.role = match target.value().as_str() {
+                                                    "admin" => Role::Admin,
+                                                    "viewer" => Role::Viewer,
+                                                    _ => Role::Operator,
+                                                };
+                                                user_form.set(next);
+                                            })
+                                        }}>
+                                            <option value="operator" selected={user_form.role == Role::Operator}>{"Operator"}</option>
+                                            <option value="admin" selected={user_form.role == Role::Admin}>{"Admin"}</option>
+                                            <option value="viewer" selected={user_form.role == Role::Viewer}>{"Viewer"}</option>
+                                        </select>
+                                    </label>
+                                    <div class="actions">
+                                        <button class="primary" type="submit">{"Create user"}</button>
+                                        <StatusBadge status={(*status).clone()} />
+                                    </div>
+                                </form>
+                                <div class="cards">
+                                    { for (*users).iter().cloned().map(|user| {
+                                        let id = user.id;
+                                        html!{
+                                            <article class="card">
+                                                <div class="card-head">
+                                                    <div>
+                                                        <p class="eyebrow">{"User"}</p>
+                                                        <h3>{user.username.clone()}</h3>
+                                                        <p class="muted">{format!("{:?}", user.role)}</p>
+                                                    </div>
+                                                    <div class="pill-row">
+                                                        <button class="ghost" onclick={{
+                                                            let users = users.clone();
+                                                            let status = status.clone();
+                                                            Callback::from(move |_| {
+                                                                let users = users.clone();
+                                                                let status = status.clone();
+                                                                spawn_local(async move {
+                                                                    match api_delete_user(id).await {
+                                                                        Ok(_) => {
+                                                                            users.set(users.iter().cloned().filter(|u| u.id != id).collect());
+                                                                            status.set(StatusLine::success("Deleted user"));
+                                                                        }
+                                                                        Err(err) => status.set(StatusLine::error(err)),
+                                                                    }
+                                                                });
+                                                            })
+                                                        }}>{"Delete"}</button>
+                                                    </div>
+                                                </div>
+                                            </article>
+                                        }
+                                    })}
+                                </div>
+                            </section>
                         }
                     }
-                </section>
+                }
             </main>
         </div>
     }
@@ -604,6 +916,25 @@ struct ListenerForm {
 }
 
 #[derive(Clone, PartialEq)]
+enum Tab {
+    Listeners,
+    Users,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct UserForm {
+    username: String,
+    password: String,
+    role: Role,
+}
+
+#[derive(Clone, PartialEq)]
 enum StickyMode {
     None,
     Cookie,
@@ -622,6 +953,25 @@ impl Default for ListenerForm {
             key_path: String::new(),
             sticky: StickyMode::None,
             cookie_name: String::from("BALOR_STICKY"),
+        }
+    }
+}
+
+impl Default for LoginForm {
+    fn default() -> Self {
+        Self {
+            username: String::from("admin"),
+            password: String::new(),
+        }
+    }
+}
+
+impl Default for UserForm {
+    fn default() -> Self {
+        Self {
+            username: String::new(),
+            password: String::new(),
+            role: Role::Operator,
         }
     }
 }
@@ -731,6 +1081,23 @@ impl ListenerForm {
     }
 }
 
+impl UserForm {
+    fn to_payload(&self) -> Result<UserPayload, String> {
+        if self.username.trim().is_empty() {
+            return Err("Username is required".into());
+        }
+        if self.password.trim().is_empty() {
+            return Err("Password is required".into());
+        }
+
+        Ok(UserPayload {
+            username: self.username.clone(),
+            role: self.role.clone(),
+            password: self.password.clone(),
+        })
+    }
+}
+
 fn to_upstream_payload(
     index: usize,
     line: &str,
@@ -778,27 +1145,30 @@ fn checkbox_checked(event: &Event) -> bool {
         .unwrap_or(false)
 }
 
-fn load_token() -> Option<String> {
+fn load_session() -> Option<Session> {
     web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item("balor_admin_token").ok().flatten())
+        .and_then(|s| s.get_item("balor_session").ok().flatten())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
 }
 
-fn save_token(token: &str) {
+fn save_session(session: &Session) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.set_item("balor_admin_token", token);
+        if let Ok(json) = serde_json::to_string(session) {
+            let _ = storage.set_item("balor_session", &json);
+        }
     }
 }
 
-fn clear_token() {
+fn clear_session_storage() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.remove_item("balor_admin_token");
+        let _ = storage.remove_item("balor_session");
     }
 }
 
 fn with_auth(req: gloo_net::http::RequestBuilder) -> gloo_net::http::RequestBuilder {
-    if let Some(token) = load_token() {
-        req.header("Authorization", &format!("Bearer {token}"))
+    if let Some(session) = load_session() {
+        req.header("Authorization", &format!("Bearer {}", session.token))
     } else {
         req
     }
@@ -861,6 +1231,67 @@ async fn api_delete_listener(id: Uuid) -> Result<(), String> {
             .await
             .unwrap_or_else(|_| "<unable to read body>".into());
         Err(format!("{status}: {body}"))
+    }
+}
+
+async fn api_users() -> Result<Vec<User>, String> {
+    let resp = with_auth(Request::get("/api/users"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<Vec<User>>(resp).await
+}
+
+async fn api_create_user(payload: UserPayload) -> Result<User, String> {
+    let resp = with_auth(Request::post("/api/users"))
+        .json(&payload)
+        .map_err(|e| format!("serialize: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<User>(resp).await
+}
+
+async fn api_delete_user(id: Uuid) -> Result<(), String> {
+    let url = format!("/api/users/{}", id);
+    let resp = with_auth(Request::delete(&url))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unable to read body>".into());
+        Err(format!("{status}: {body}"))
+    }
+}
+
+async fn api_login(username: String, password: String) -> Result<Session, String> {
+    let resp = Request::post("/api/login")
+        .json(&json!({ "username": username, "password": password }))
+        .map_err(|e| format!("serialize: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<Session>(resp).await
+}
+
+async fn api_logout(token: &str) -> Result<(), String> {
+    let resp = with_auth(Request::post("/api/logout"))
+        .json(&json!({ "token": token }))
+        .map_err(|e| format!("serialize: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(format!("logout failed: {}", resp.status()))
     }
 }
 

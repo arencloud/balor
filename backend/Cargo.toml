@@ -25,3 +25,6 @@ tower-http = { version = "0.5.2", features = ["cors", "fs", "trace"] }
 parking_lot = "0.12.2"
 tokio-util = { version = "0.7.11", features = ["rt"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+argon2 = "0.5.3"
+rand = "0.8.5"
+rand_core = "0.6.4"

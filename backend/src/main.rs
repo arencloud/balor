@@ -2,17 +2,23 @@
 // Author: Eduard Gevorkyan (egevorky@arencloud.com)
 // License: Apache 2.0
 
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, Path, State},
     http::{HeaderName, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, get_service, post},
-    Json, Router,
+    routing::{get, get_service, post, put},
+    Extension, Json, Router,
 };
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use parking_lot::RwLock;
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::hash_map::DefaultHasher,
@@ -129,6 +135,8 @@ struct StickyPayload {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ConfigStore {
     listeners: HashMap<Uuid, ListenerConfig>,
+    #[serde(default)]
+    users: HashMap<Uuid, UserRecord>,
 }
 
 struct AppContext {
@@ -137,6 +145,7 @@ struct AppContext {
     state_path: PathBuf,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
     admin_token: Option<String>,
+    sessions: RwLock<HashMap<String, Session>>,
 }
 
 type AppState = Arc<AppContext>;
@@ -161,6 +170,66 @@ struct StatsResponse {
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Role {
+    Admin,
+    Operator,
+    Viewer,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct UserRecord {
+    id: Uuid,
+    username: String,
+    role: Role,
+    password_hash: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UserPayload {
+    username: String,
+    role: Role,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UserResponse {
+    id: Uuid,
+    username: String,
+    role: Role,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LoginPayload {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    token: String,
+    username: String,
+    role: Role,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogoutPayload {
+    token: String,
+}
+
+#[derive(Debug, Clone)]
+struct Session {
+    username: String,
+    role: Role,
+}
+
+#[derive(Clone)]
+struct AuthContext {
+    username: String,
+    role: Role,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -208,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
         state_path,
         health: health_map.clone(),
         admin_token,
+        sessions: RwLock::new(HashMap::new()),
     });
 
     let admin_dist = resolve_admin_dist();
@@ -218,18 +288,26 @@ async fn main() -> anyhow::Result<()> {
 
     let api = Router::new()
         .route("/health", get(health))
-        .route("/stats", get(stats))
-        .route("/listeners", post(create_listener).get(list_listeners))
-        .route(
-            "/listeners/:id",
-            get(get_listener)
-                .put(update_listener)
-                .delete(delete_listener),
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .merge(
+            Router::new()
+                .route("/stats", get(stats))
+                .route("/listeners", post(create_listener).get(list_listeners))
+                .route(
+                    "/listeners/:id",
+                    get(get_listener)
+                        .put(update_listener)
+                        .delete(delete_listener),
+                )
+                .route("/users", get(list_users).post(create_user))
+                .route("/users/:id", put(update_user).delete(delete_user))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    admin_auth_guard,
+                ))
+                .with_state(state.clone()),
         )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            admin_auth_guard,
-        ))
         .with_state(state.clone());
 
     let assets_dir = admin_dist.join("assets");
@@ -278,6 +356,160 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         active_runtimes: state.supervisor.active_runtimes(),
     };
     Json(response)
+}
+
+async fn list_users(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<Vec<UserResponse>>, StatusCode> {
+    require_admin(&ctx)?;
+    let store = state.store.read();
+    let users = store
+        .users
+        .values()
+        .map(|u| UserResponse {
+            id: u.id,
+            username: u.username.clone(),
+            role: u.role.clone(),
+        })
+        .collect();
+
+    Ok(Json(users))
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<UserPayload>,
+) -> Result<Json<UserResponse>, StatusCode> {
+    require_admin(&ctx)?;
+    let mut store = state.store.write();
+
+    if store.users.values().any(|u| u.username == payload.username) {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let password_hash = hash_password(&payload.password).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let record = UserRecord {
+        id: Uuid::new_v4(),
+        username: payload.username.clone(),
+        role: payload.role.clone(),
+        password_hash,
+    };
+
+    store.users.insert(record.id, record.clone());
+    drop(store);
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(UserResponse {
+        id: record.id,
+        username: record.username,
+        role: record.role,
+    }))
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<UserPayload>,
+) -> Result<Json<UserResponse>, StatusCode> {
+    require_admin(&ctx)?;
+    {
+        let mut store = state.store.write();
+        let Some(record) = store.users.get_mut(&id) else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+
+        record.username = payload.username.clone();
+        record.role = payload.role.clone();
+        record.password_hash =
+            hash_password(&payload.password).map_err(|_| StatusCode::BAD_REQUEST)?;
+    }
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let store = state.store.read();
+    let record = store.users.get(&id).unwrap();
+    Ok(Json(UserResponse {
+        id: record.id,
+        username: record.username.clone(),
+        role: record.role.clone(),
+    }))
+}
+
+async fn delete_user(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<StatusCode, StatusCode> {
+    require_admin(&ctx)?;
+    {
+        let mut store = state.store.write();
+        if store.users.remove(&id).is_none() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn login(
+    State(state): State<AppState>,
+    Json(payload): Json<LoginPayload>,
+) -> Result<Json<LoginResponse>, StatusCode> {
+    if let Some(admin_token) = state.admin_token.as_ref() {
+        if payload.password == *admin_token {
+            let token = generate_token();
+            state.sessions.write().insert(
+                token.clone(),
+                Session {
+                    username: "admin".into(),
+                    role: Role::Admin,
+                },
+            );
+            return Ok(Json(LoginResponse {
+                token,
+                username: "admin".into(),
+                role: Role::Admin,
+            }));
+        }
+    }
+
+    let store = state.store.read();
+    let Some(user) = store
+        .users
+        .values()
+        .find(|u| u.username == payload.username)
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let username = user.username.clone();
+    let role = user.role.clone();
+    let password_hash = user.password_hash.clone();
+    drop(store);
+
+    if !verify_password(&payload.password, &password_hash).unwrap_or(false) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let token = generate_token();
+    state.sessions.write().insert(
+        token.clone(),
+        Session {
+            username: username.clone(),
+            role: role.clone(),
+        },
+    );
+
+    Ok(Json(LoginResponse {
+        token,
+        username,
+        role,
+    }))
+}
+
+async fn logout(State(state): State<AppState>, Json(body): Json<LogoutPayload>) -> StatusCode {
+    state.sessions.write().remove(&body.token);
+    StatusCode::NO_CONTENT
 }
 
 async fn list_listeners(State(state): State<AppState>) -> Json<Vec<ListenerConfig>> {
@@ -827,13 +1059,9 @@ fn sticky_from_cookie(req: &Request<Body>, name: &str) -> Option<Uuid> {
 
 async fn admin_auth_guard(
     State(state): State<AppState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
-    let Some(expected) = state.admin_token.clone() else {
-        return Ok(next.run(req).await);
-    };
-
     let token = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -841,11 +1069,45 @@ async fn admin_auth_guard(
         .and_then(|h| h.strip_prefix("Bearer "))
         .map(|s| s.trim().to_string());
 
-    if token.as_deref() != Some(expected.as_str()) {
+    let Some(token) = token else {
         return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    let mut role = None;
+    let mut username = None;
+
+    if let Some(expected) = state.admin_token.as_ref() {
+        if &token == expected {
+            role = Some(Role::Admin);
+            username = Some("admin_env".to_string());
+        }
     }
 
+    if role.is_none() {
+        if let Some(session) = state.sessions.read().get(&token).cloned() {
+            role = Some(session.role);
+            username = Some(session.username);
+        }
+    }
+
+    let Some(role) = role else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    req.extensions_mut().insert(AuthContext {
+        username: username.unwrap_or_default(),
+        role,
+    });
+
     Ok(next.run(req).await)
+}
+
+fn require_admin(ctx: &AuthContext) -> Result<(), StatusCode> {
+    if ctx.role == Role::Admin {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 fn resolve_admin_dist() -> PathBuf {
@@ -895,6 +1157,28 @@ fn persist_store(state: &AppState) -> Result<(), std::io::Error> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     std::fs::write(&state.state_path, json)?;
     Ok(())
+}
+
+fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+}
+
+fn verify_password(password: &str, hash: &str) -> Result<bool, argon2::password_hash::Error> {
+    let parsed = PasswordHash::new(hash)?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
+}
+
+fn generate_token() -> String {
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(48)
+        .map(char::from)
+        .collect()
 }
 
 async fn hydrate_supervisor(state: AppState) -> anyhow::Result<()> {
