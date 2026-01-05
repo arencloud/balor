@@ -21,6 +21,7 @@ use std::{
         Arc,
     },
 };
+use tokio::task::JoinSet;
 use tokio::{
     io,
     net::{TcpListener, TcpStream},
@@ -76,7 +77,7 @@ struct UpstreamPayload {
     enabled: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ConfigStore {
     listeners: HashMap<Uuid, ListenerConfig>,
 }
@@ -84,6 +85,7 @@ struct ConfigStore {
 struct AppContext {
     store: RwLock<ConfigStore>,
     supervisor: BalancerSupervisor,
+    state_path: PathBuf,
 }
 
 type AppState = Arc<AppContext>;
@@ -139,13 +141,20 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let state_path = resolve_state_path();
+    let initial_store = load_store(&state_path).unwrap_or_default();
+    let supervisor = BalancerSupervisor::default();
+
     let state: AppState = Arc::new(AppContext {
-        store: RwLock::new(ConfigStore::default()),
-        supervisor: BalancerSupervisor::default(),
+        store: RwLock::new(initial_store),
+        supervisor,
+        state_path,
     });
 
     let admin_dist = resolve_admin_dist();
     let admin_index = admin_dist.join("index.html");
+
+    hydrate_supervisor(state.clone()).await?;
 
     let api = Router::new()
         .route("/health", get(health))
@@ -236,8 +245,11 @@ async fn create_listener(
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    let mut store = state.store.write();
-    store.listeners.insert(id, config.clone());
+    {
+        let mut store = state.store.write();
+        store.listeners.insert(id, config.clone());
+    }
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
     Ok(Json(config))
 }
 
@@ -261,6 +273,7 @@ async fn update_listener(
         .upsert(config.clone())
         .await
         .map_err(|_| ApiError::Internal)?;
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
 
     Ok(Json(config))
 }
@@ -277,6 +290,7 @@ async fn delete_listener(
         }
     }
     state.supervisor.remove(&id).await;
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -582,4 +596,46 @@ fn resolve_admin_dist() -> PathBuf {
         );
     }
     default
+}
+
+fn resolve_state_path() -> PathBuf {
+    std::env::var("BALOR_STATE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/balor_state.json"))
+}
+
+fn load_store(path: &PathBuf) -> Option<ConfigStore> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn persist_store(state: &AppState) -> Result<(), std::io::Error> {
+    let store = state.store.read();
+    if let Some(parent) = state.state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&*store)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(&state.state_path, json)?;
+    Ok(())
+}
+
+async fn hydrate_supervisor(state: AppState) -> anyhow::Result<()> {
+    let listeners: Vec<ListenerConfig> = {
+        let store = state.store.read();
+        store.listeners.values().cloned().collect()
+    };
+
+    let mut tasks = JoinSet::new();
+    for listener in listeners {
+        let sup = state.supervisor.clone();
+        tasks.spawn(async move {
+            if let Err(err) = sup.upsert(listener.clone()).await {
+                warn!("failed to start listener {}: {err:?}", listener.name);
+            }
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+    Ok(())
 }
