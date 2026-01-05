@@ -4,7 +4,7 @@
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderName, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, get_service, post},
@@ -14,7 +14,9 @@ use axum_server::{tls_rustls::RustlsConfig, Handle};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::hash_map::DefaultHasher,
     collections::HashMap,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -49,9 +51,23 @@ enum Protocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StickyStrategy {
+    Cookie,
+    IpHash,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TlsConfig {
     cert_path: String,
     key_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StickyConfig {
+    strategy: StickyStrategy,
+    #[serde(default)]
+    cookie_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +89,8 @@ struct ListenerConfig {
     upstreams: Vec<Upstream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls: Option<TlsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sticky: Option<StickyConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +101,8 @@ struct ListenerPayload {
     upstreams: Vec<UpstreamPayload>,
     #[serde(default)]
     tls: Option<TlsPayload>,
+    #[serde(default)]
+    sticky: Option<StickyPayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +116,13 @@ struct UpstreamPayload {
 struct TlsPayload {
     cert_path: String,
     key_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StickyPayload {
+    strategy: StickyStrategy,
+    #[serde(default)]
+    cookie_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -337,6 +364,7 @@ impl ListenerPayload {
             protocol,
             upstreams,
             tls,
+            sticky,
         } = self;
 
         validate_listen(&listen)?;
@@ -354,6 +382,15 @@ impl ListenerPayload {
             (Protocol::Tcp, None) => None,
         };
 
+        let sticky = match (protocol.clone(), sticky) {
+            (Protocol::Http, sticky @ Some(_)) => sticky.map(|s| s.into_config()).transpose()?,
+            (Protocol::Http, None) => None,
+            (Protocol::Tcp, Some(_)) => {
+                return Err("Sticky sessions are only supported for HTTP listeners".into())
+            }
+            (Protocol::Tcp, None) => None,
+        };
+
         if upstreams.is_empty() {
             return Err("at least one upstream is required".into());
         }
@@ -365,6 +402,7 @@ impl ListenerPayload {
             protocol,
             upstreams,
             tls,
+            sticky,
         })
     }
 }
@@ -394,6 +432,20 @@ impl TlsPayload {
         Ok(TlsConfig {
             cert_path: self.cert_path,
             key_path: self.key_path,
+        })
+    }
+}
+
+impl StickyPayload {
+    fn into_config(self) -> Result<StickyConfig, String> {
+        let cookie_name = self
+            .cookie_name
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| Some("BALOR_STICKY".to_string()));
+
+        Ok(StickyConfig {
+            strategy: self.strategy,
+            cookie_name,
         })
     }
 }
@@ -462,19 +514,25 @@ struct HttpProxyState {
     position: Arc<AtomicUsize>,
     client: reqwest::Client,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
+    sticky: Option<StickyConfig>,
 }
 
 impl HttpProxyState {
-    fn new(upstreams: Vec<Upstream>, health: Arc<RwLock<HashMap<Uuid, bool>>>) -> Self {
+    fn new(
+        upstreams: Vec<Upstream>,
+        health: Arc<RwLock<HashMap<Uuid, bool>>>,
+        sticky: Option<StickyConfig>,
+    ) -> Self {
         Self {
             upstreams: Arc::new(upstreams),
             position: Arc::new(AtomicUsize::new(0)),
             client: reqwest::Client::new(),
             health,
+            sticky,
         }
     }
 
-    fn next_upstream(&self) -> Option<Upstream> {
+    fn next_upstream(&self, req: &Request<Body>, peer: &SocketAddr) -> Option<UpstreamSelection> {
         let health = self.health.read();
         let enabled: Vec<_> = self
             .upstreams
@@ -486,8 +544,57 @@ impl HttpProxyState {
             return None;
         }
 
-        let idx = self.position.fetch_add(1, Ordering::Relaxed) % enabled.len();
-        enabled.get(idx).cloned()
+        match &self.sticky {
+            Some(StickyConfig {
+                strategy: StickyStrategy::Cookie,
+                cookie_name,
+            }) => {
+                if let Some(cookie_upstream) =
+                    sticky_from_cookie(req, cookie_name.as_deref().unwrap_or("BALOR_STICKY"))
+                {
+                    if let Some(found) = enabled.iter().find(|u| u.id == cookie_upstream) {
+                        return Some(UpstreamSelection {
+                            upstream: found.clone(),
+                            set_cookie: None,
+                        });
+                    }
+                }
+
+                let idx = self.position.fetch_add(1, Ordering::Relaxed) % enabled.len();
+                let upstream = enabled
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| enabled[0].clone());
+
+                let name = cookie_name.as_deref().unwrap_or("BALOR_STICKY").to_string();
+                let value = upstream.id.to_string();
+
+                Some(UpstreamSelection {
+                    upstream: upstream.clone(),
+                    set_cookie: Some((name, value)),
+                })
+            }
+            Some(StickyConfig {
+                strategy: StickyStrategy::IpHash,
+                ..
+            }) => {
+                let addr = peer.ip();
+                let mut hasher = DefaultHasher::new();
+                Hash::hash(&addr, &mut hasher);
+                let idx = (hasher.finish() as usize) % enabled.len();
+                enabled.get(idx).cloned().map(|u| UpstreamSelection {
+                    upstream: u,
+                    set_cookie: None,
+                })
+            }
+            None => {
+                let idx = self.position.fetch_add(1, Ordering::Relaxed) % enabled.len();
+                enabled.get(idx).cloned().map(|u| UpstreamSelection {
+                    upstream: u,
+                    set_cookie: None,
+                })
+            }
+        }
     }
 }
 
@@ -497,7 +604,7 @@ async fn run_http_listener(
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config.listen.parse()?;
-    let state = HttpProxyState::new(config.upstreams.clone(), health);
+    let state = HttpProxyState::new(config.upstreams.clone(), health, config.sticky.clone());
 
     let router = Router::new().fallback(proxy_http).with_state(state);
     info!(
@@ -517,7 +624,7 @@ async fn run_http_listener(
         let handle = Handle::new();
         let server = axum_server::bind_rustls(listen_addr, tls_config)
             .handle(handle.clone())
-            .serve(router.into_make_service());
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>());
 
         tokio::select! {
             res = server => {
@@ -530,7 +637,10 @@ async fn run_http_listener(
         }
     } else {
         let listener = TcpListener::bind(listen_addr).await?;
-        let server = axum::serve(listener, router.into_make_service());
+        let server = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        );
 
         server
             .with_graceful_shutdown(async move {
@@ -615,9 +725,13 @@ fn pick_round_robin(
 
 async fn proxy_http(
     State(state): State<HttpProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    let upstream = state.next_upstream().ok_or(StatusCode::BAD_GATEWAY)?;
+    let selection = state
+        .next_upstream(&request, &peer)
+        .ok_or(StatusCode::BAD_GATEWAY)?;
+    let upstream = selection.upstream;
     let path = request
         .uri()
         .path_and_query()
@@ -657,6 +771,11 @@ async fn proxy_http(
         }
     }
 
+    if let Some((name, value)) = selection.set_cookie {
+        let cookie = format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax");
+        resp_builder = resp_builder.header(axum::http::header::SET_COOKIE, cookie);
+    }
+
     resp_builder
         .body(Body::from(bytes))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -674,6 +793,28 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+#[derive(Clone)]
+struct UpstreamSelection {
+    upstream: Upstream,
+    set_cookie: Option<(String, String)>,
+}
+
+fn sticky_from_cookie(req: &Request<Body>, name: &str) -> Option<Uuid> {
+    let header = req.headers().get(axum::http::header::COOKIE)?;
+    let Ok(cookie_str) = header.to_str() else {
+        return None;
+    };
+    for part in cookie_str.split(';') {
+        let trimmed = part.trim();
+        if let Some((k, v)) = trimmed.split_once('=') {
+            if k.trim() == name {
+                return Uuid::parse_str(v.trim()).ok();
+            }
+        }
+    }
+    None
 }
 
 fn resolve_admin_dist() -> PathBuf {

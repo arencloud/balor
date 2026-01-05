@@ -18,6 +18,20 @@ enum Protocol {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum StickyStrategy {
+    Cookie,
+    IpHash,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct StickyConfig {
+    strategy: StickyStrategy,
+    #[serde(default)]
+    cookie_name: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct TlsConfig {
     cert_path: String,
     key_path: String,
@@ -42,6 +56,8 @@ struct Listener {
     upstreams: Vec<Upstream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls: Option<TlsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sticky: Option<StickyConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -59,6 +75,8 @@ struct ListenerPayload {
     upstreams: Vec<UpstreamPayload>,
     #[serde(default)]
     tls: Option<TlsConfig>,
+    #[serde(default)]
+    sticky: Option<StickyConfig>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -275,6 +293,7 @@ fn app() -> Html {
                                             next.tls_enabled = false;
                                             next.cert_path.clear();
                                             next.key_path.clear();
+                                            next.sticky = StickyMode::None;
                                         }
                                         form.set(next);
                                     })
@@ -283,6 +302,30 @@ fn app() -> Html {
                                 <option value="http" selected={form.protocol == Protocol::Http}>{"HTTP (L7)"}</option>
                                 <option value="tcp" selected={form.protocol == Protocol::Tcp}>{"TCP (L4)"}</option>
                             </select>
+                        </label>
+                        <label class="field">
+                            <span>{"Session affinity"}</span>
+                            <select
+                                disabled={form.protocol == Protocol::Tcp}
+                                onchange={{
+                                    let form = form.clone();
+                                    Callback::from(move |e: Event| {
+                                        let mut next = (*form).clone();
+                                        let target: web_sys::HtmlSelectElement = e.target_unchecked_into();
+                                        next.sticky = match target.value().as_str() {
+                                            "cookie" => StickyMode::Cookie,
+                                            "ip_hash" => StickyMode::IpHash,
+                                            _ => StickyMode::None,
+                                        };
+                                        form.set(next);
+                                    })
+                                }}
+                            >
+                                <option value="none" selected={form.sticky == StickyMode::None}>{"None (round robin)"}</option>
+                                <option value="cookie" selected={form.sticky == StickyMode::Cookie}>{"Cookie (per upstream)"}</option>
+                                <option value="ip_hash" selected={form.sticky == StickyMode::IpHash}>{"Client IP hash"}</option>
+                            </select>
+                            <p class="hint">{"HTTP only. Cookie sets a sticky upstream id."}</p>
                         </label>
                         <label class="field span-2">
                             <span>{"Upstreams (one per line, optional label via name=url)"}</span>
@@ -354,6 +397,29 @@ fn app() -> Html {
                                                 placeholder="/etc/ssl/private/balor.key"
                                             />
                                         </label>
+                                        {
+                                            if form.sticky == StickyMode::Cookie {
+                                                html!{
+                                                    <label class="field">
+                                                        <span>{"Sticky cookie name"}</span>
+                                                        <input
+                                                            value={form.cookie_name.clone()}
+                                                            oninput={{
+                                                                let form = form.clone();
+                                                                Callback::from(move |e: InputEvent| {
+                                                                    let mut next = (*form).clone();
+                                                                    next.cookie_name = event_value(&e);
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                            placeholder="BALOR_STICKY"
+                                                        />
+                                                    </label>
+                                                }
+                                            } else {
+                                                html!{}
+                                            }
+                                        }
                                     </>
                                 }
                             } else {
@@ -462,6 +528,13 @@ fn render_listener(
                         html! {}
                     }
                 }
+                {
+                    match &listener.sticky {
+                        Some(StickyConfig { strategy: StickyStrategy::Cookie, .. }) => html!{ <span class="pill pill-on">{"Sticky: Cookie"}</span> },
+                        Some(StickyConfig { strategy: StickyStrategy::IpHash, .. }) => html!{ <span class="pill pill-on">{"Sticky: IP hash"}</span> },
+                        None => html!{},
+                    }
+                }
             </div>
             <div class="pill-row">
                 { for listener.upstreams.iter().map(|u| {
@@ -490,6 +563,15 @@ struct ListenerForm {
     tls_enabled: bool,
     cert_path: String,
     key_path: String,
+    sticky: StickyMode,
+    cookie_name: String,
+}
+
+#[derive(Clone, PartialEq)]
+enum StickyMode {
+    None,
+    Cookie,
+    IpHash,
 }
 
 impl Default for ListenerForm {
@@ -502,6 +584,8 @@ impl Default for ListenerForm {
             tls_enabled: false,
             cert_path: String::new(),
             key_path: String::new(),
+            sticky: StickyMode::None,
+            cookie_name: String::from("BALOR_STICKY"),
         }
     }
 }
@@ -521,6 +605,19 @@ impl ListenerForm {
             (false, String::new(), String::new())
         };
 
+        let (sticky, cookie_name) = if let Some(sticky) = &listener.sticky {
+            let name = sticky
+                .cookie_name
+                .clone()
+                .unwrap_or_else(|| "BALOR_STICKY".to_string());
+            match sticky.strategy {
+                StickyStrategy::Cookie => (StickyMode::Cookie, name),
+                StickyStrategy::IpHash => (StickyMode::IpHash, name),
+            }
+        } else {
+            (StickyMode::None, "BALOR_STICKY".to_string())
+        };
+
         Self {
             name: listener.name.clone(),
             listen: listener.listen.clone(),
@@ -529,6 +626,8 @@ impl ListenerForm {
             tls_enabled,
             cert_path,
             key_path,
+            sticky,
+            cookie_name,
         }
     }
 
@@ -564,12 +663,34 @@ impl ListenerForm {
             None
         };
 
+        let sticky = if self.protocol == Protocol::Http {
+            match self.sticky {
+                StickyMode::None => None,
+                StickyMode::Cookie => {
+                    if self.cookie_name.trim().is_empty() {
+                        return Err("Cookie name is required for cookie affinity".into());
+                    }
+                    Some(StickyConfig {
+                        strategy: StickyStrategy::Cookie,
+                        cookie_name: Some(self.cookie_name.clone()),
+                    })
+                }
+                StickyMode::IpHash => Some(StickyConfig {
+                    strategy: StickyStrategy::IpHash,
+                    cookie_name: Some(self.cookie_name.clone()),
+                }),
+            }
+        } else {
+            None
+        };
+
         Ok(ListenerPayload {
             name: self.name.clone(),
             listen: self.listen.clone(),
             protocol: self.protocol.clone(),
             upstreams,
             tls,
+            sticky,
         })
     }
 }
