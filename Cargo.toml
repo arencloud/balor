@@ -1,0 +1,20 @@
+[workspace]
+members = ["backend", "admin"]
+resolver = "2"
+
+[workspace.package]
+license = "Apache-2.0"
+authors = ["Eduard Gevorkyan <egevorky@arencloud.com>"]
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1.0.82"
+axum = { version = "0.7.5", features = ["macros"] }
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.117"
+thiserror = "1.0.61"
+tokio = { version = "1.38.0", features = ["full"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt"] }
+uuid = { version = "1.8.0", features = ["serde", "v4"] }
+
