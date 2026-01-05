@@ -99,6 +99,7 @@ fn app() -> Html {
     let loading = use_state(|| false);
     let editing = use_state(|| None::<Uuid>);
     let stats = use_state(Stats::default);
+    let auth_token = use_state(load_token);
 
     {
         let listeners = listeners.clone();
@@ -229,6 +230,41 @@ fn app() -> Html {
                 <div class="meta">
                     <div class="pill">{"Rust + WASM UI"}</div>
                     <div class="pill pill-glow">{"Round robin HTTP/TCP"}</div>
+                    <div class="auth">
+                        <input
+                            type="password"
+                            value={auth_token.as_ref().cloned().unwrap_or_default()}
+                            oninput={{
+                                let auth_token = auth_token.clone();
+                                Callback::from(move |e: InputEvent| {
+                                    auth_token.set(Some(event_value(&e)));
+                                })
+                            }}
+                            placeholder="Admin token"
+                        />
+                        <button class="ghost" type="button" onclick={{
+                            let auth_token = auth_token.clone();
+                            let status = status.clone();
+                            Callback::from(move |_| {
+                                if let Some(token) = auth_token.as_ref() {
+                                    save_token(token);
+                                    status.set(StatusLine::success("Saved token"));
+                                } else {
+                                    clear_token();
+                                    status.set(StatusLine::success("Cleared token"));
+                                }
+                            })
+                        }}>{"Save"}</button>
+                        <button class="ghost" type="button" onclick={{
+                            let auth_token = auth_token.clone();
+                            let status = status.clone();
+                            Callback::from(move |_| {
+                                auth_token.set(None);
+                                clear_token();
+                                status.set(StatusLine::success("Cleared token"));
+                            })
+                        }}>{"Clear"}</button>
+                    </div>
                 </div>
             </header>
             <section class="stat-grid">
@@ -742,8 +778,34 @@ fn checkbox_checked(event: &Event) -> bool {
         .unwrap_or(false)
 }
 
+fn load_token() -> Option<String> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item("balor_admin_token").ok().flatten())
+}
+
+fn save_token(token: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item("balor_admin_token", token);
+    }
+}
+
+fn clear_token() {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item("balor_admin_token");
+    }
+}
+
+fn with_auth(req: gloo_net::http::RequestBuilder) -> gloo_net::http::RequestBuilder {
+    if let Some(token) = load_token() {
+        req.header("Authorization", &format!("Bearer {token}"))
+    } else {
+        req
+    }
+}
+
 async fn api_listeners() -> Result<Vec<Listener>, String> {
-    let resp = Request::get("/api/listeners")
+    let resp = with_auth(Request::get("/api/listeners"))
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -752,7 +814,7 @@ async fn api_listeners() -> Result<Vec<Listener>, String> {
 }
 
 async fn api_stats() -> Result<Stats, String> {
-    let resp = Request::get("/api/stats")
+    let resp = with_auth(Request::get("/api/stats"))
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -761,7 +823,7 @@ async fn api_stats() -> Result<Stats, String> {
 }
 
 async fn api_create_listener(payload: ListenerPayload) -> Result<Listener, String> {
-    let resp = Request::post("/api/listeners")
+    let resp = with_auth(Request::post("/api/listeners"))
         .json(&payload)
         .map_err(|e| format!("serialize: {e}"))?
         .send()
@@ -773,7 +835,7 @@ async fn api_create_listener(payload: ListenerPayload) -> Result<Listener, Strin
 
 async fn api_update_listener(id: Uuid, payload: ListenerPayload) -> Result<Listener, String> {
     let url = format!("/api/listeners/{}", id);
-    let resp = Request::put(&url)
+    let resp = with_auth(Request::put(&url))
         .json(&payload)
         .map_err(|e| format!("serialize: {e}"))?
         .send()
@@ -785,7 +847,7 @@ async fn api_update_listener(id: Uuid, payload: ListenerPayload) -> Result<Liste
 
 async fn api_delete_listener(id: Uuid) -> Result<(), String> {
     let url = format!("/api/listeners/{}", id);
-    let resp = Request::delete(&url)
+    let resp = with_auth(Request::delete(&url))
         .send()
         .await
         .map_err(|e| format!("delete failed: {e}"))?;

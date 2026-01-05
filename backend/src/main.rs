@@ -6,6 +6,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, Path, State},
     http::{HeaderName, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, get_service, post},
     Json, Router,
@@ -135,6 +136,7 @@ struct AppContext {
     supervisor: BalancerSupervisor,
     state_path: PathBuf,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
+    admin_token: Option<String>,
 }
 
 type AppState = Arc<AppContext>;
@@ -198,12 +200,14 @@ async fn main() -> anyhow::Result<()> {
         tasks: Arc::new(RwLock::new(HashMap::new())),
         health: health_map.clone(),
     };
+    let admin_token = std::env::var("BALOR_ADMIN_TOKEN").ok();
 
     let state: AppState = Arc::new(AppContext {
         store: RwLock::new(initial_store),
         supervisor,
         state_path,
         health: health_map.clone(),
+        admin_token,
     });
 
     let admin_dist = resolve_admin_dist();
@@ -222,6 +226,10 @@ async fn main() -> anyhow::Result<()> {
                 .put(update_listener)
                 .delete(delete_listener),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth_guard,
+        ))
         .with_state(state.clone());
 
     let assets_dir = admin_dist.join("assets");
@@ -815,6 +823,29 @@ fn sticky_from_cookie(req: &Request<Body>, name: &str) -> Option<Uuid> {
         }
     }
     None
+}
+
+async fn admin_auth_guard(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response<Body>, StatusCode> {
+    let Some(expected) = state.admin_token.clone() else {
+        return Ok(next.run(req).await);
+    };
+
+    let token = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string());
+
+    if token.as_deref() != Some(expected.as_str()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(req).await)
 }
 
 fn resolve_admin_dist() -> PathBuf {
