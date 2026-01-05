@@ -72,4 +72,5 @@ Environment knobs:
 - HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port.
 - State persists to `data/balor_state.json` on each change (path override via `BALOR_STATE_FILE`).
 - Background health checks run every ~5 seconds and mark upstreams up/down in the UI automatically.
+- HTTP listeners can terminate TLS via PEM cert/key paths; files are reloaded when they change.
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.

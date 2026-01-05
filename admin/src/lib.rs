@@ -18,6 +18,12 @@ enum Protocol {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct TlsConfig {
+    cert_path: String,
+    key_path: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct Upstream {
     id: Uuid,
     name: String,
@@ -34,6 +40,8 @@ struct Listener {
     listen: String,
     protocol: Protocol,
     upstreams: Vec<Upstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<TlsConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,6 +57,8 @@ struct ListenerPayload {
     listen: String,
     protocol: Protocol,
     upstreams: Vec<UpstreamPayload>,
+    #[serde(default)]
+    tls: Option<TlsConfig>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -261,6 +271,11 @@ fn app() -> Html {
                                         let mut next = (*form).clone();
                                         let target: web_sys::HtmlSelectElement = e.target_unchecked_into();
                                         next.protocol = if target.value() == "tcp" { Protocol::Tcp } else { Protocol::Http };
+                                        if next.protocol == Protocol::Tcp {
+                                            next.tls_enabled = false;
+                                            next.cert_path.clear();
+                                            next.key_path.clear();
+                                        }
                                         form.set(next);
                                     })
                                 }}
@@ -285,6 +300,66 @@ fn app() -> Html {
                                 placeholder="api=http://127.0.0.1:7000\ntcp1=127.0.0.1:7001"
                             />
                         </label>
+                        {
+                            if form.protocol == Protocol::Http {
+                                html!{
+                                    <>
+                                        <label class="field">
+                                            <span>{"TLS termination (PEM paths)"}</span>
+                                            <div class="inline">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={form.tls_enabled}
+                                                    onchange={{
+                                                        let form = form.clone();
+                                                        Callback::from(move |e: Event| {
+                                                            let mut next = (*form).clone();
+                                                            next.tls_enabled = checkbox_checked(&e);
+                                                            form.set(next);
+                                                        })
+                                                    }}
+                                                />
+                                                <p class="hint">{"Enable Rustls with cert/key PEM files"}</p>
+                                            </div>
+                                        </label>
+                                        <label class="field">
+                                            <span>{"Certificate path"}</span>
+                                            <input
+                                                value={form.cert_path.clone()}
+                                                disabled={!form.tls_enabled}
+                                                oninput={{
+                                                    let form = form.clone();
+                                                    Callback::from(move |e: InputEvent| {
+                                                        let mut next = (*form).clone();
+                                                        next.cert_path = event_value(&e);
+                                                        form.set(next);
+                                                    })
+                                                }}
+                                                placeholder="/etc/ssl/certs/balor.crt"
+                                            />
+                                        </label>
+                                        <label class="field">
+                                            <span>{"Private key path"}</span>
+                                            <input
+                                                value={form.key_path.clone()}
+                                                disabled={!form.tls_enabled}
+                                                oninput={{
+                                                    let form = form.clone();
+                                                    Callback::from(move |e: InputEvent| {
+                                                        let mut next = (*form).clone();
+                                                        next.key_path = event_value(&e);
+                                                        form.set(next);
+                                                    })
+                                                }}
+                                                placeholder="/etc/ssl/private/balor.key"
+                                            />
+                                        </label>
+                                    </>
+                                }
+                            } else {
+                                html!{}
+                            }
+                        }
                         <div class="actions">
                             <button class="primary" type="submit" disabled={*loading}>
                                 { if editing.is_some() { "Update listener" } else { "Save listener" } }
@@ -373,6 +448,22 @@ fn render_listener(
                 </div>
             </div>
             <div class="pill-row">
+                {
+                    if listener.protocol == Protocol::Http {
+                        html! { <span class="pill">{"HTTP"}</span> }
+                    } else {
+                        html! { <span class="pill">{"TCP"}</span> }
+                    }
+                }
+                {
+                    if listener.tls.is_some() {
+                        html! { <span class="pill pill-glow">{"TLS"}</span> }
+                    } else {
+                        html! {}
+                    }
+                }
+            </div>
+            <div class="pill-row">
                 { for listener.upstreams.iter().map(|u| {
                     let (status, class) = match u.healthy {
                         Some(true) => ("up", "pill pill-on"),
@@ -396,6 +487,9 @@ struct ListenerForm {
     listen: String,
     protocol: Protocol,
     upstreams_text: String,
+    tls_enabled: bool,
+    cert_path: String,
+    key_path: String,
 }
 
 impl Default for ListenerForm {
@@ -405,6 +499,9 @@ impl Default for ListenerForm {
             listen: String::from("0.0.0.0:9000"),
             protocol: Protocol::Http,
             upstreams_text: String::from("http://127.0.0.1:7000"),
+            tls_enabled: false,
+            cert_path: String::new(),
+            key_path: String::new(),
         }
     }
 }
@@ -418,11 +515,20 @@ impl ListenerForm {
             .collect::<Vec<_>>()
             .join("\n");
 
+        let (tls_enabled, cert_path, key_path) = if let Some(tls) = &listener.tls {
+            (true, tls.cert_path.clone(), tls.key_path.clone())
+        } else {
+            (false, String::new(), String::new())
+        };
+
         Self {
             name: listener.name.clone(),
             listen: listener.listen.clone(),
             protocol: listener.protocol.clone(),
             upstreams_text,
+            tls_enabled,
+            cert_path,
+            key_path,
         }
     }
 
@@ -446,11 +552,24 @@ impl ListenerForm {
             return Err("Add at least one upstream".into());
         }
 
+        let tls = if self.tls_enabled && self.protocol == Protocol::Http {
+            if self.cert_path.trim().is_empty() || self.key_path.trim().is_empty() {
+                return Err("Provide TLS cert and key paths".into());
+            }
+            Some(TlsConfig {
+                cert_path: self.cert_path.clone(),
+                key_path: self.key_path.clone(),
+            })
+        } else {
+            None
+        };
+
         Ok(ListenerPayload {
             name: self.name.clone(),
             listen: self.listen.clone(),
             protocol: self.protocol.clone(),
             upstreams,
+            tls,
         })
     }
 }
@@ -492,6 +611,14 @@ fn textarea_value(event: &InputEvent) -> String {
         .and_then(|t| t.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
         .map(|input| input.value())
         .unwrap_or_default()
+}
+
+fn checkbox_checked(event: &Event) -> bool {
+    event
+        .target()
+        .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .map(|input| input.checked())
+        .unwrap_or(false)
 }
 
 async fn api_listeners() -> Result<Vec<Listener>, String> {

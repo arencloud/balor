@@ -10,6 +10,7 @@ use axum::{
     routing::{get, get_service, post},
     Json, Router,
 };
+use axum_server::{tls_rustls::RustlsConfig, Handle};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -48,6 +49,12 @@ enum Protocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct TlsConfig {
+    cert_path: String,
+    key_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Upstream {
     id: Uuid,
     name: String,
@@ -64,6 +71,8 @@ struct ListenerConfig {
     listen: String,
     protocol: Protocol,
     upstreams: Vec<Upstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<TlsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +81,8 @@ struct ListenerPayload {
     listen: String,
     protocol: Protocol,
     upstreams: Vec<UpstreamPayload>,
+    #[serde(default)]
+    tls: Option<TlsPayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +90,12 @@ struct UpstreamPayload {
     name: String,
     address: String,
     enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TlsPayload {
+    cert_path: String,
+    key_path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -319,6 +336,7 @@ impl ListenerPayload {
             listen,
             protocol,
             upstreams,
+            tls,
         } = self;
 
         validate_listen(&listen)?;
@@ -326,6 +344,15 @@ impl ListenerPayload {
             .into_iter()
             .map(|u| u.into_upstream())
             .collect::<Result<Vec<_>, _>>()?;
+
+        let tls = match (protocol.clone(), tls) {
+            (Protocol::Http, tls @ Some(_)) => tls.map(|t| t.into_config()).transpose()?,
+            (Protocol::Http, None) => None,
+            (Protocol::Tcp, Some(_)) => {
+                return Err("TLS is only supported for HTTP listeners".into())
+            }
+            (Protocol::Tcp, None) => None,
+        };
 
         if upstreams.is_empty() {
             return Err("at least one upstream is required".into());
@@ -337,6 +364,7 @@ impl ListenerPayload {
             listen,
             protocol,
             upstreams,
+            tls,
         })
     }
 }
@@ -353,6 +381,19 @@ impl UpstreamPayload {
             address: self.address,
             enabled: self.enabled,
             healthy: None,
+        })
+    }
+}
+
+impl TlsPayload {
+    fn into_config(self) -> Result<TlsConfig, String> {
+        if self.cert_path.trim().is_empty() || self.key_path.trim().is_empty() {
+            return Err("TLS cert and key paths are required when TLS is enabled".into());
+        }
+
+        Ok(TlsConfig {
+            cert_path: self.cert_path,
+            key_path: self.key_path,
         })
     }
 }
@@ -466,15 +507,38 @@ async fn run_http_listener(
         config.upstreams.len()
     );
 
-    let listener = TcpListener::bind(listen_addr).await?;
-    let server = axum::serve(listener, router.into_make_service());
+    if let Some(tls) = config.tls.clone() {
+        let tls_config =
+            RustlsConfig::from_pem_file(tls.cert_path.clone(), tls.key_path.clone()).await?;
+        info!(
+            "TLS enabled for '{}' using cert={} key={}",
+            config.name, tls.cert_path, tls.key_path
+        );
+        let handle = Handle::new();
+        let server = axum_server::bind_rustls(listen_addr, tls_config)
+            .handle(handle.clone())
+            .serve(router.into_make_service());
 
-    server
-        .with_graceful_shutdown(async move {
-            cancel.cancelled().await;
-            info!("Shutting down HTTP listener {}", config.name);
-        })
-        .await?;
+        tokio::select! {
+            res = server => {
+                res?;
+            }
+            _ = cancel.cancelled() => {
+                info!("Shutting down HTTP listener {}", config.name);
+                handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            }
+        }
+    } else {
+        let listener = TcpListener::bind(listen_addr).await?;
+        let server = axum::serve(listener, router.into_make_service());
+
+        server
+            .with_graceful_shutdown(async move {
+                cancel.cancelled().await;
+                info!("Shutting down HTTP listener {}", config.name);
+            })
+            .await?;
+    }
     Ok(())
 }
 
