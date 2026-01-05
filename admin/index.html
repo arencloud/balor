@@ -92,12 +92,13 @@ License: Apache 2.0 -->
       letter-spacing: -0.02em;
     }
     .logo {
-      width: 92px;
-      height: 92px;
-      border-radius: 20px;
+      width: 108px;
+      height: 108px;
+      border-radius: 26px;
       padding: 0;
-      box-shadow: none;
+      box-shadow: 0 18px 36px rgba(12, 23, 52, 0.15);
       object-fit: cover;
+      border: 1px solid rgba(12, 23, 52, 0.06);
     }
     .eyebrow {
       text-transform: uppercase;
@@ -151,35 +152,77 @@ License: Apache 2.0 -->
     }
     .stat-value { margin: 6px 0 2px; font-size: 28px; letter-spacing: -0.02em; }
     .panel {
-      background: linear-gradient(135deg, rgba(255,255,255,0.96), rgba(255,255,255,0.9));
+      background: linear-gradient(145deg, rgba(255,255,255,0.98), rgba(255,255,255,0.92));
       border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 20px 22px;
+      border-radius: 20px;
+      padding: 24px;
       box-shadow: var(--shadow);
       position: relative;
       overflow: hidden;
+      isolation: isolate;
     }
-    .panel h2 { margin: 4px 0 10px; letter-spacing: -0.02em; }
-    .panel-head { display: flex; justify-content: space-between; align-items: center; }
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: -120px -40px auto auto;
+      width: 320px;
+      height: 220px;
+      background: radial-gradient(circle, rgba(60,100,244,0.22), transparent 70%);
+      opacity: 0.6;
+      z-index: 0;
+    }
+    .panel h2 { margin: 4px 0 6px; letter-spacing: -0.02em; position: relative; z-index: 1; }
+    .panel-head { display: flex; justify-content: space-between; align-items: center; position: relative; z-index: 1; }
 
+    /* Create Listener layout */
+    .content > .panel:first-of-type {
+      border: 1px solid rgba(60, 100, 244, 0.18);
+      box-shadow: 0 25px 60px rgba(60, 100, 244, 0.18);
+      background: linear-gradient(160deg, rgba(60,100,244,0.06), rgba(27,153,139,0.05)), var(--panel);
+    }
     .form-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 12px;
-      margin-top: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px 16px;
+      margin-top: 16px;
+      position: relative;
+      z-index: 1;
     }
-    .field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); }
-    .field span { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      background: rgba(22,36,71,0.02);
+      border: 1px solid rgba(22,36,71,0.08);
+      border-radius: 14px;
+      padding: 12px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+    }
+    .field span {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #0f2c6a;
+    }
     .hint { margin: 0; font-size: 12px; color: var(--muted); }
     .field input, .field select, .field textarea {
       width: 100%;
-      background: rgba(22,36,71,0.02);
-      border: 1px solid rgba(22,36,71,0.12);
+      background: linear-gradient(180deg, #fff, rgba(255,255,255,0.9));
+      border: 1px solid rgba(22,36,71,0.08);
       border-radius: 12px;
       padding: 12px;
       color: var(--text);
       font-size: 15px;
       font-family: inherit;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.08s ease;
+    }
+    .field input:focus, .field select:focus, .field textarea:focus {
+      outline: none;
+      border-color: rgba(60,100,244,0.6);
+      box-shadow: 0 8px 24px rgba(60,100,244,0.16);
+      transform: translateY(-1px);
     }
     .field textarea { min-height: 120px; resize: vertical; }
     .span-2 { grid-column: span 2; }
@@ -200,6 +243,7 @@ License: Apache 2.0 -->
       cursor: pointer;
       box-shadow: 0 16px 40px rgba(60, 100, 244, 0.28);
     }
+    .primary:hover { transform: translateY(-1px); box-shadow: 0 18px 44px rgba(60,100,244,0.32); }
     .primary:disabled { opacity: 0.6; cursor: not-allowed; }
     .ghost {
       background: transparent;
