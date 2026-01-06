@@ -58,6 +58,8 @@ Environment knobs:
 - `BALOR_HTTP_ADDR` (default `0.0.0.0:8080`) – admin API + UI bind address.
 - `BALOR_ADMIN_DIST` (default `admin/dist`) – path where the Yew assets are served from.
 - `BALOR_STATE_FILE` (default `data/balor_state.json`) – persisted listener config storage.
+- `BALOR_DEFAULT_ADMIN_PASSWORD` (default `admin`) – bootstrap password for the auto-created `admin` user if no users exist.
+- `BALOR_ADMIN_TOKEN` (optional) – alternative bearer token that always maps to `admin` role (bypasses password).
 
 ## API sketch
 - `GET /api/health` – service heartbeat.
@@ -67,10 +69,14 @@ Environment knobs:
 - `GET /api/listeners/{id}` – fetch a listener.
 - `PUT /api/listeners/{id}` – update a listener.
 - `DELETE /api/listeners/{id}` – remove a listener and stop its runtime.
+- `POST /api/login` / `POST /api/logout` – session tokens for the UI.
+- `GET/POST/PUT/DELETE /api/users` – RBAC user management (admin only).
 
 ## Notes
 - HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port.
 - State persists to `data/balor_state.json` on each change (path override via `BALOR_STATE_FILE`).
 - Background health checks run every ~5 seconds and mark upstreams up/down in the UI automatically.
 - HTTP listeners can terminate TLS via PEM cert/key paths; files are reloaded when they change.
+- Sticky sessions supported per HTTP listener (cookie or client IP hash).
+- RBAC roles: Admin (full), Operator (CRUD listeners), Viewer (read-only).
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.
