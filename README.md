@@ -10,14 +10,15 @@ Rust-native L4/L7 load balancer with an Axum admin API and a Yew (WASM) control 
 ```mermaid
 flowchart LR
     subgraph ControlPlane["Control Plane (Axum)"]
-        API["/api/* (CRUD)"]
+        API["/api/* (CRUD + Auth/RBAC)"]
         Supervisor["Listener Supervisor"]
-        Store["In-memory Config Store"]
+        Store["Config Store (file)"]
         Static["/assets + UI (ServeDir)"]
     end
     subgraph AdminUI["Admin UI (Yew/WASM)"]
         Form["Create/Edit Listener"]
-        List["Active Listeners + Stats"]
+        List["Active Listeners + Health"]
+        Auth["Login + Users (Admin)"]
     end
     subgraph DataPlane["Data Plane"]
         HTTP["HTTP L7 Balancer\n(Axum proxy)"]
