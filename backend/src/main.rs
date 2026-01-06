@@ -9,7 +9,7 @@ use argon2::{
 use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, Path, State},
-    http::{HeaderName, Request, StatusCode},
+    http::{header, HeaderName, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, get_service, post, put},
@@ -17,6 +17,9 @@ use axum::{
 };
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use parking_lot::RwLock;
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -30,7 +33,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
 use tokio::{
@@ -146,6 +149,7 @@ struct AppContext {
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
     admin_token: Option<String>,
     sessions: RwLock<HashMap<String, Session>>,
+    metrics: Arc<Metrics>,
 }
 
 type AppState = Arc<AppContext>;
@@ -154,6 +158,7 @@ type AppState = Arc<AppContext>;
 struct BalancerSupervisor {
     tasks: Arc<RwLock<HashMap<Uuid, BalancerHandle>>>,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
+    metrics: Arc<Metrics>,
 }
 
 struct BalancerHandle {
@@ -167,9 +172,89 @@ struct StatsResponse {
     active_runtimes: usize,
 }
 
+#[derive(Clone)]
+struct Metrics {
+    registry: Registry,
+    http_requests: IntCounterVec,
+    http_latency: HistogramVec,
+    tcp_connections: IntCounterVec,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let registry = Registry::new();
+        let http_requests = IntCounterVec::new(
+            Opts::new("balor_http_requests_total", "HTTP requests per listener"),
+            &["listener_id", "status"],
+        )
+        .expect("create http counter");
+        let http_latency = HistogramVec::new(
+            HistogramOpts::new(
+                "balor_http_request_duration_seconds",
+                "HTTP request duration per listener",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["listener_id"],
+        )
+        .expect("create latency histogram");
+        let tcp_connections = IntCounterVec::new(
+            Opts::new(
+                "balor_tcp_connections_total",
+                "TCP connections per listener",
+            ),
+            &["listener_id"],
+        )
+        .expect("create tcp counter");
+
+        registry
+            .register(Box::new(http_requests.clone()))
+            .expect("register http counter");
+        registry
+            .register(Box::new(http_latency.clone()))
+            .expect("register latency histogram");
+        registry
+            .register(Box::new(tcp_connections.clone()))
+            .expect("register tcp counter");
+
+        Self {
+            registry,
+            http_requests,
+            http_latency,
+            tcp_connections,
+        }
+    }
+
+    fn observe_http(&self, listener: Uuid, status: StatusCode, latency: Duration) {
+        let id = listener.to_string();
+        self.http_requests
+            .with_label_values(&[&id, status.as_str()])
+            .inc();
+        self.http_latency
+            .with_label_values(&[&id])
+            .observe(latency.as_secs_f64());
+    }
+
+    fn observe_tcp(&self, listener: Uuid) {
+        let id = listener.to_string();
+        self.tcp_connections.with_label_values(&[&id]).inc();
+    }
+
+    fn export(&self) -> Vec<u8> {
+        let encoder = TextEncoder::new();
+        let metric_families = self.registry.gather();
+        let mut buffer = Vec::new();
+        if encoder.encode(&metric_families, &mut buffer).is_err() {
+            return b"# metrics encoding failed\n".to_vec();
+        }
+        buffer
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -267,9 +352,11 @@ async fn main() -> anyhow::Result<()> {
     let mut initial_store = load_store(&state_path).unwrap_or_default();
     ensure_bootstrap_admin(&mut initial_store);
     let health_map = Arc::new(RwLock::new(HashMap::new()));
+    let metrics = Arc::new(Metrics::new());
     let supervisor = BalancerSupervisor {
         tasks: Arc::new(RwLock::new(HashMap::new())),
         health: health_map.clone(),
+        metrics: metrics.clone(),
     };
     let admin_token = std::env::var("BALOR_ADMIN_TOKEN").ok();
 
@@ -280,6 +367,7 @@ async fn main() -> anyhow::Result<()> {
         health: health_map.clone(),
         admin_token,
         sessions: RwLock::new(HashMap::new()),
+        metrics,
     });
 
     let admin_dist = resolve_admin_dist();
@@ -318,6 +406,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .nest("/api", api)
+        .route("/metrics", get(metrics_handler))
         .nest_service(
             "/assets",
             get_service(ServeDir::new(assets_dir))
@@ -330,7 +419,8 @@ async fn main() -> anyhow::Result<()> {
                 .allow_methods(Any)
                 .allow_origin(Any),
         )
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .with_state(state.clone());
 
     let addr: SocketAddr = std::env::var("BALOR_HTTP_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
@@ -349,6 +439,19 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> Response<Body> {
+    let body = state.metrics.export();
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        TextEncoder::new()
+            .format_type()
+            .parse()
+            .unwrap_or_else(|_| header::HeaderValue::from_static("text/plain")),
+    );
+    response
 }
 
 async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
@@ -703,7 +806,7 @@ impl BalancerSupervisor {
     async fn upsert(&self, config: ListenerConfig) -> anyhow::Result<()> {
         let id = config.id;
         self.remove(&config.id).await;
-        let handle = spawn_listener(config, self.health.clone()).await?;
+        let handle = spawn_listener(config, self.health.clone(), self.metrics.clone()).await?;
         self.tasks.write().insert(id, handle);
         Ok(())
     }
@@ -730,6 +833,7 @@ impl BalancerSupervisor {
 async fn spawn_listener(
     config: ListenerConfig,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<BalancerHandle> {
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
@@ -738,8 +842,8 @@ async fn spawn_listener(
 
     let join = tokio::spawn(async move {
         let result = match protocol_for_task {
-            Protocol::Http => run_http_listener(config, cancel_for_task, health).await,
-            Protocol::Tcp => run_tcp_listener(config, cancel_for_task, health).await,
+            Protocol::Http => run_http_listener(config, cancel_for_task, health, metrics).await,
+            Protocol::Tcp => run_tcp_listener(config, cancel_for_task, health, metrics).await,
         };
 
         if let Err(err) = result {
@@ -752,25 +856,31 @@ async fn spawn_listener(
 
 #[derive(Clone)]
 struct HttpProxyState {
+    listener_id: Uuid,
     upstreams: Arc<Vec<Upstream>>,
     position: Arc<AtomicUsize>,
     client: reqwest::Client,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
     sticky: Option<StickyConfig>,
+    metrics: Arc<Metrics>,
 }
 
 impl HttpProxyState {
     fn new(
+        listener_id: Uuid,
         upstreams: Vec<Upstream>,
         health: Arc<RwLock<HashMap<Uuid, bool>>>,
         sticky: Option<StickyConfig>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
+            listener_id,
             upstreams: Arc::new(upstreams),
             position: Arc::new(AtomicUsize::new(0)),
             client: reqwest::Client::new(),
             health,
             sticky,
+            metrics,
         }
     }
 
@@ -844,9 +954,16 @@ async fn run_http_listener(
     config: ListenerConfig,
     cancel: CancellationToken,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config.listen.parse()?;
-    let state = HttpProxyState::new(config.upstreams.clone(), health, config.sticky.clone());
+    let state = HttpProxyState::new(
+        config.id,
+        config.upstreams.clone(),
+        health,
+        config.sticky.clone(),
+        metrics.clone(),
+    );
 
     let router = Router::new().fallback(proxy_http).with_state(state);
     info!(
@@ -898,8 +1015,10 @@ async fn run_tcp_listener(
     config: ListenerConfig,
     cancel: CancellationToken,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config.listen.parse()?;
+    let listener_id = config.id;
     let upstreams: Arc<Vec<_>> =
         Arc::new(config.upstreams.into_iter().filter(|u| u.enabled).collect());
     let cursor = Arc::new(AtomicUsize::new(0));
@@ -925,6 +1044,7 @@ async fn run_tcp_listener(
             }
         };
 
+        metrics.observe_tcp(listener_id);
         let Some(upstream) = pick_round_robin(&upstreams, &cursor, &health) else {
             warn!(
                 "No enabled upstreams for {}, closing connection from {}",
@@ -970,9 +1090,16 @@ async fn proxy_http(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    let selection = state
-        .next_upstream(&request, &peer)
-        .ok_or(StatusCode::BAD_GATEWAY)?;
+    let start = Instant::now();
+    let selection = match state.next_upstream(&request, &peer) {
+        Some(sel) => sel,
+        None => {
+            state
+                .metrics
+                .observe_http(state.listener_id, StatusCode::BAD_GATEWAY, start.elapsed());
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
     let upstream = selection.upstream;
     let path = request
         .uri()
@@ -993,18 +1120,27 @@ async fn proxy_http(
         }
     }
 
-    let response = builder
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let response = match builder.body(body_bytes).send().await {
+        Ok(resp) => resp,
+        Err(_) => {
+            state
+                .metrics
+                .observe_http(state.listener_id, StatusCode::BAD_GATEWAY, start.elapsed());
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
 
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(_) => {
+            state
+                .metrics
+                .observe_http(state.listener_id, StatusCode::BAD_GATEWAY, start.elapsed());
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
 
     let mut resp_builder = Response::builder().status(status);
     for (key, value) in headers.iter() {
@@ -1018,9 +1154,15 @@ async fn proxy_http(
         resp_builder = resp_builder.header(axum::http::header::SET_COOKIE, cookie);
     }
 
-    resp_builder
+    let body = resp_builder
         .body(Body::from(bytes))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    state
+        .metrics
+        .observe_http(state.listener_id, status, start.elapsed());
+
+    Ok(body)
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {

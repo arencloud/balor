@@ -28,3 +28,4 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 argon2 = "0.5.3"
 rand = "0.8.5"
 rand_core = "0.6.4"
+prometheus = "0.13.4"

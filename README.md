@@ -84,4 +84,6 @@ Environment knobs:
 - HTTP listeners can terminate TLS via PEM cert/key paths; files are reloaded when they change.
 - Sticky sessions supported per HTTP listener (cookie or client IP hash).
 - RBAC roles: Admin (full), Operator (CRUD listeners), Viewer (read-only).
+- Prometheus metrics exposed at `/metrics` (HTTP counters/latency and TCP connection totals per listener).
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.
+- Browser support note: Chrome/Chromium render the admin dashboard fully; Firefox currently has partial support for the Users/Metrics tabs (layout issues under investigation).
