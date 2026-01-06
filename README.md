@@ -2,6 +2,10 @@
 
 Rust-native L4/L7 load balancer with an Axum admin API and a Yew (WASM) control panel.
 
+<p align="center">
+  <img src="images/balor.png" alt="Balor logo" width="180" style="border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.16);" />
+</p>
+
 **Author:** Eduard Gevorkyan (egevorky@arencloud.com)  
 **License:** Apache 2.0
 
