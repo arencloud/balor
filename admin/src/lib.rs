@@ -334,61 +334,55 @@ fn app() -> Html {
 
     if session.is_none() {
         return html! {
-            <div class="page">
-                <header class="hero">
-                    <div class="brand">
+            <div class="login-shell">
+                <div class="login-card">
+                    <div style="text-align:center;">
                         <img src="assets/balor.png" alt="Balor logo" class="logo" />
-                        <div>
-                            <p class="eyebrow">{"Load Balancer L4-L7"}</p>
-                            <h1>{"Balor Control"}</h1>
+                        <p class="eyebrow">{"Balor Control"}</p>
+                        <h1>{"Welcome back"}</h1>
+                        <p class="muted">{"Sign in to manage listeners and users."}</p>
+                    </div>
+                    <form class="form-grid" onsubmit={on_login.clone()}>
+                        <label class="field">
+                            <span>{"Username"}</span>
+                            <input
+                                value={login_form.username.clone()}
+                                oninput={{
+                                    let login_form = login_form.clone();
+                                    Callback::from(move |e: InputEvent| {
+                                        let mut next = (*login_form).clone();
+                                        next.username = event_value(&e);
+                                        login_form.set(next);
+                                    })
+                                }}
+                                placeholder="admin"
+                                autocomplete="username"
+                            />
+                        </label>
+                        <label class="field">
+                            <span>{"Password"}</span>
+                            <input
+                                type="password"
+                                value={login_form.password.clone()}
+                                oninput={{
+                                    let login_form = login_form.clone();
+                                    Callback::from(move |e: InputEvent| {
+                                        let mut next = (*login_form).clone();
+                                        next.password = event_value(&e);
+                                        login_form.set(next);
+                                    })
+                                }}
+                                placeholder="••••••••"
+                                autocomplete="current-password"
+                            />
+                        </label>
+                        <div class="actions">
+                            <button class="primary" type="submit">{"Login"}</button>
+                            <StatusBadge status={(*status).clone()} />
                         </div>
-                    </div>
-                    <div class="meta">
-                        <div class="pill">{"Please sign in"}</div>
-                    </div>
-                </header>
-                <main class="content">
-                    <section class="panel">
-                        <h2>{"Login"}</h2>
-                        <form class="form-grid" onsubmit={on_login.clone()}>
-                            <label class="field">
-                                <span>{"Username"}</span>
-                                <input
-                                    value={login_form.username.clone()}
-                                    oninput={{
-                                        let login_form = login_form.clone();
-                                        Callback::from(move |e: InputEvent| {
-                                            let mut next = (*login_form).clone();
-                                            next.username = event_value(&e);
-                                            login_form.set(next);
-                                        })
-                                    }}
-                                    placeholder="admin"
-                                />
-                            </label>
-                            <label class="field">
-                                <span>{"Password"}</span>
-                                <input
-                                    r#type="password"
-                                    value={login_form.password.clone()}
-                                    oninput={{
-                                        let login_form = login_form.clone();
-                                        Callback::from(move |e: InputEvent| {
-                                            let mut next = (*login_form).clone();
-                                            next.password = event_value(&e);
-                                            login_form.set(next);
-                                        })
-                                    }}
-                                    placeholder="•••••••"
-                                />
-                            </label>
-                            <div class="actions">
-                                <button class="primary" type="submit">{"Login"}</button>
-                                <StatusBadge status={(*status).clone()} />
-                            </div>
-                        </form>
-                    </section>
-                </main>
+                        <p class="muted">{"Default admin/password comes from BALOR_DEFAULT_ADMIN_PASSWORD (fallback 'admin'). Token is set automatically after login."}</p>
+                    </form>
+                </div>
             </div>
         };
     }

@@ -222,13 +222,11 @@ struct LogoutPayload {
 
 #[derive(Debug, Clone)]
 struct Session {
-    username: String,
     role: Role,
 }
 
 #[derive(Clone)]
 struct AuthContext {
-    username: String,
     role: Role,
 }
 
@@ -238,6 +236,8 @@ enum ApiError {
     NotFound,
     #[error("bad input: {0}")]
     BadRequest(String),
+    #[error("forbidden")]
+    Forbidden,
     #[error("internal error")]
     Internal,
 }
@@ -247,6 +247,7 @@ impl IntoResponse for ApiError {
         let status = match self {
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Forbidden => StatusCode::FORBIDDEN,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
@@ -263,7 +264,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let state_path = resolve_state_path();
-    let initial_store = load_store(&state_path).unwrap_or_default();
+    let mut initial_store = load_store(&state_path).unwrap_or_default();
+    ensure_bootstrap_admin(&mut initial_store);
     let health_map = Arc::new(RwLock::new(HashMap::new()));
     let supervisor = BalancerSupervisor {
         tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -460,13 +462,10 @@ async fn login(
     if let Some(admin_token) = state.admin_token.as_ref() {
         if payload.password == *admin_token {
             let token = generate_token();
-            state.sessions.write().insert(
-                token.clone(),
-                Session {
-                    username: "admin".into(),
-                    role: Role::Admin,
-                },
-            );
+            state
+                .sessions
+                .write()
+                .insert(token.clone(), Session { role: Role::Admin });
             return Ok(Json(LoginResponse {
                 token,
                 username: "admin".into(),
@@ -492,13 +491,10 @@ async fn login(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let token = generate_token();
-    state.sessions.write().insert(
-        token.clone(),
-        Session {
-            username: username.clone(),
-            role: role.clone(),
-        },
-    );
+    state
+        .sessions
+        .write()
+        .insert(token.clone(), Session { role: role.clone() });
 
     Ok(Json(LoginResponse {
         token,
@@ -537,8 +533,10 @@ async fn get_listener(
 #[axum::debug_handler]
 async fn create_listener(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Json(payload): Json<ListenerPayload>,
 ) -> Result<Json<ListenerConfig>, ApiError> {
+    require_operator(&ctx)?;
     let id = Uuid::new_v4();
     let config = payload.into_config(id).map_err(ApiError::BadRequest)?;
     state
@@ -558,9 +556,11 @@ async fn create_listener(
 #[axum::debug_handler]
 async fn update_listener(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
     Json(payload): Json<ListenerPayload>,
 ) -> Result<Json<ListenerConfig>, ApiError> {
+    require_operator(&ctx)?;
     let config = payload.into_config(id).map_err(ApiError::BadRequest)?;
     {
         let mut store = state.store.write();
@@ -583,8 +583,10 @@ async fn update_listener(
 #[axum::debug_handler]
 async fn delete_listener(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    require_operator(&ctx)?;
     {
         let mut store = state.store.write();
         if store.listeners.remove(&id).is_none() {
@@ -1074,19 +1076,16 @@ async fn admin_auth_guard(
     };
 
     let mut role = None;
-    let mut username = None;
 
     if let Some(expected) = state.admin_token.as_ref() {
         if &token == expected {
             role = Some(Role::Admin);
-            username = Some("admin_env".to_string());
         }
     }
 
     if role.is_none() {
         if let Some(session) = state.sessions.read().get(&token).cloned() {
             role = Some(session.role);
-            username = Some(session.username);
         }
     }
 
@@ -1094,10 +1093,7 @@ async fn admin_auth_guard(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    req.extensions_mut().insert(AuthContext {
-        username: username.unwrap_or_default(),
-        role,
-    });
+    req.extensions_mut().insert(AuthContext { role });
 
     Ok(next.run(req).await)
 }
@@ -1107,6 +1103,13 @@ fn require_admin(ctx: &AuthContext) -> Result<(), StatusCode> {
         Ok(())
     } else {
         Err(StatusCode::FORBIDDEN)
+    }
+}
+
+fn require_operator(ctx: &AuthContext) -> Result<(), ApiError> {
+    match ctx.role {
+        Role::Admin | Role::Operator => Ok(()),
+        Role::Viewer => Err(ApiError::Forbidden),
     }
 }
 
@@ -1179,6 +1182,34 @@ fn generate_token() -> String {
         .take(48)
         .map(char::from)
         .collect()
+}
+
+fn ensure_bootstrap_admin(store: &mut ConfigStore) {
+    if !store.users.is_empty() {
+        return;
+    }
+
+    let password = std::env::var("BALOR_DEFAULT_ADMIN_PASSWORD").unwrap_or_else(|_| {
+        warn!("BALOR_DEFAULT_ADMIN_PASSWORD not set; using insecure default 'admin'");
+        "admin".to_string()
+    });
+
+    let hash = match hash_password(&password) {
+        Ok(h) => h,
+        Err(err) => {
+            warn!("Failed to hash default admin password: {err}");
+            return;
+        }
+    };
+
+    let record = UserRecord {
+        id: Uuid::new_v4(),
+        username: "admin".to_string(),
+        role: Role::Admin,
+        password_hash: hash,
+    };
+
+    store.users.insert(record.id, record);
 }
 
 async fn hydrate_supervisor(state: AppState) -> anyhow::Result<()> {
