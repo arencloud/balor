@@ -34,7 +34,7 @@ use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -43,7 +43,7 @@ use std::{
 };
 use tokio::task::JoinSet;
 use tokio::{
-    io,
+    fs, io,
     net::{TcpListener, TcpStream},
     task::JoinHandle,
     time,
@@ -88,6 +88,16 @@ struct StickyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcmeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Upstream {
     id: Uuid,
     name: String,
@@ -108,6 +118,8 @@ struct ListenerConfig {
     tls: Option<TlsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sticky: Option<StickyConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme: Option<AcmeConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +132,8 @@ struct ListenerPayload {
     tls: Option<TlsPayload>,
     #[serde(default)]
     sticky: Option<StickyPayload>,
+    #[serde(default)]
+    acme: Option<AcmePayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +154,16 @@ struct StickyPayload {
     strategy: StickyStrategy,
     #[serde(default)]
     cookie_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcmePayload {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    directory_url: Option<String>,
+    #[serde(default)]
+    cache_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -717,6 +741,7 @@ impl ListenerPayload {
             upstreams,
             tls,
             sticky,
+            acme,
         } = self;
 
         validate_listen(&listen)?;
@@ -743,6 +768,19 @@ impl ListenerPayload {
             (Protocol::Tcp, None) => None,
         };
 
+        let acme = match (protocol.clone(), acme) {
+            (Protocol::Http, acme @ Some(_)) => acme.map(|a| a.into_config()).transpose()?,
+            (Protocol::Http, None) => None,
+            (Protocol::Tcp, Some(_)) => {
+                return Err("ACME automation is only supported for HTTP listeners".into())
+            }
+            (Protocol::Tcp, None) => None,
+        };
+
+        if tls.is_some() && acme.is_some() {
+            return Err("TLS paths and ACME cannot both be set; choose one".into());
+        }
+
         if upstreams.is_empty() {
             return Err("at least one upstream is required".into());
         }
@@ -755,6 +793,7 @@ impl ListenerPayload {
             upstreams,
             tls,
             sticky,
+            acme,
         })
     }
 }
@@ -798,6 +837,16 @@ impl StickyPayload {
         Ok(StickyConfig {
             strategy: self.strategy,
             cookie_name,
+        })
+    }
+}
+
+impl AcmePayload {
+    fn into_config(self) -> Result<AcmeConfig, String> {
+        Ok(AcmeConfig {
+            email: self.email,
+            directory_url: self.directory_url,
+            cache_dir: self.cache_dir,
         })
     }
 }
@@ -973,6 +1022,14 @@ async fn run_http_listener(
     );
 
     let router = Router::new().fallback(proxy_http).with_state(state);
+    if config.acme.is_some() {
+        let dir = std::env::var("BALOR_ACME_CHALLENGE_DIR")
+            .unwrap_or_else(|_| "data/acme-challenges".to_string());
+        info!(
+            "ACME HTTP-01 responder active for '{}' (challenge dir: {})",
+            config.name, dir
+        );
+    }
     info!(
         "Starting HTTP balancer '{}' on {} -> {} upstreams",
         config.name,
@@ -1092,11 +1149,17 @@ fn pick_round_robin(
     active.get(idx).cloned()
 }
 
+#[axum::debug_handler]
 async fn proxy_http(
     State(state): State<HttpProxyState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
+    let path_for_acme = request.uri().path().to_string();
+    if let Some(resp) = try_acme_challenge(&path_for_acme).await {
+        return Ok(resp);
+    }
+
     let start = Instant::now();
     let selection = match state.next_upstream(&request, &peer) {
         Some(sel) => sel,
@@ -1394,6 +1457,39 @@ fn websocket_accept(key: &str) -> String {
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let digest = hasher.finalize();
     BASE64_STD.encode(digest)
+}
+
+async fn try_acme_challenge(path: &str) -> Option<Response<Body>> {
+    const PREFIX: &str = "/.well-known/acme-challenge/";
+    if !path.starts_with(PREFIX) {
+        return None;
+    }
+    let token = path.trim_start_matches(PREFIX);
+    if token.is_empty() {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .ok()?,
+        );
+    }
+    let dir = std::env::var("BALOR_ACME_CHALLENGE_DIR")
+        .unwrap_or_else(|_| "data/acme-challenges".to_string());
+    let challenge_path = FsPath::new(&dir).join(token);
+    match fs::read_to_string(&challenge_path).await {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(body))
+            .ok(),
+        Err(err) => {
+            warn!("ACME challenge token {} not found: {}", token, err);
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .ok()
+        }
+    }
 }
 
 fn rewrite_set_cookie(
