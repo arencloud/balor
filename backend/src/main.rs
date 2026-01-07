@@ -13,7 +13,7 @@ use axum::{
     http::{header, HeaderName, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, get_service, post, put},
+    routing::{delete, get, get_service, post, put},
     Extension, Json, Router,
 };
 use axum_server::{tls_rustls::RustlsConfig, Handle};
@@ -74,6 +74,21 @@ enum StickyStrategy {
     IpHash,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum AcmeChallenge {
+    Http01,
+    Dns01,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DnsProvider {
+    Cloudflare,
+    Route53,
+    Generic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TlsConfig {
     cert_path: String,
@@ -95,6 +110,10 @@ struct AcmeConfig {
     directory_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_dir: Option<String>,
+    #[serde(default = "default_acme_challenge")]
+    challenge: AcmeChallenge,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +183,36 @@ struct AcmePayload {
     directory_url: Option<String>,
     #[serde(default)]
     cache_dir: Option<String>,
+    #[serde(default = "AcmePayload::default_challenge")]
+    challenge: AcmeChallenge,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+impl AcmePayload {
+    fn default_challenge() -> AcmeChallenge {
+        AcmeChallenge::Http01
+    }
+}
+
+fn default_acme_challenge() -> AcmeChallenge {
+    AcmeChallenge::Http01
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcmeProviderConfig {
+    name: String,
+    provider: DnsProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    txt_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -171,6 +220,8 @@ struct ConfigStore {
     listeners: HashMap<Uuid, ListenerConfig>,
     #[serde(default)]
     users: HashMap<Uuid, UserRecord>,
+    #[serde(default)]
+    acme_providers: Vec<AcmeProviderConfig>,
 }
 
 struct AppContext {
@@ -423,6 +474,11 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route("/users", get(list_users).post(create_user))
                 .route("/users/:id", put(update_user).delete(delete_user))
+                .route(
+                    "/acme/providers",
+                    get(list_acme_providers).post(upsert_acme_provider),
+                )
+                .route("/acme/providers/:name", delete(delete_acme_provider))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     admin_auth_guard,
@@ -589,6 +645,58 @@ async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_acme_providers(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<Vec<AcmeProviderConfig>>, StatusCode> {
+    require_admin(&ctx)?;
+    let store = state.store.read();
+    Ok(Json(store.acme_providers.clone()))
+}
+
+async fn upsert_acme_provider(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<AcmeProviderConfig>,
+) -> Result<Json<AcmeProviderConfig>, StatusCode> {
+    require_admin(&ctx)?;
+    if payload.name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    {
+        let mut store = state.store.write();
+        if let Some(existing) = store
+            .acme_providers
+            .iter_mut()
+            .find(|p| p.name == payload.name)
+        {
+            *existing = payload.clone();
+        } else {
+            store.acme_providers.push(payload.clone());
+        }
+    }
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(payload))
+}
+
+async fn delete_acme_provider(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    require_admin(&ctx)?;
+    {
+        let mut store = state.store.write();
+        let len_before = store.acme_providers.len();
+        store.acme_providers.retain(|p| p.name != name);
+        if store.acme_providers.len() == len_before {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
@@ -673,6 +781,10 @@ async fn create_listener(
     require_operator(&ctx)?;
     let id = Uuid::new_v4();
     let config = payload.into_config(id).map_err(ApiError::BadRequest)?;
+    {
+        let store = state.store.read();
+        validate_acme_config(&config.acme, &store).map_err(ApiError::BadRequest)?;
+    }
     state
         .supervisor
         .upsert(config.clone())
@@ -696,6 +808,10 @@ async fn update_listener(
 ) -> Result<Json<ListenerConfig>, ApiError> {
     require_operator(&ctx)?;
     let config = payload.into_config(id).map_err(ApiError::BadRequest)?;
+    {
+        let store = state.store.read();
+        validate_acme_config(&config.acme, &store).map_err(ApiError::BadRequest)?;
+    }
     {
         let mut store = state.store.write();
         if !store.listeners.contains_key(&id) {
@@ -843,10 +959,16 @@ impl StickyPayload {
 
 impl AcmePayload {
     fn into_config(self) -> Result<AcmeConfig, String> {
+        if self.challenge == AcmeChallenge::Dns01 && self.provider.is_none() {
+            return Err("DNS-01 requires a DNS provider name".into());
+        }
+
         Ok(AcmeConfig {
             email: self.email,
             directory_url: self.directory_url,
             cache_dir: self.cache_dir,
+            challenge: self.challenge,
+            provider: self.provider,
         })
     }
 }
@@ -856,6 +978,27 @@ fn validate_listen(listen: &str) -> Result<(), String> {
         .parse::<SocketAddr>()
         .map(|_| ())
         .map_err(|e| format!("invalid listen address {listen}: {e}"))
+}
+
+fn validate_acme_config(acme: &Option<AcmeConfig>, store: &ConfigStore) -> Result<(), String> {
+    if let Some(acme) = acme {
+        if let AcmeChallenge::Dns01 = acme.challenge {
+            let Some(provider_name) = &acme.provider else {
+                return Err("DNS-01 requires a DNS provider reference".into());
+            };
+            let exists = store
+                .acme_providers
+                .iter()
+                .any(|p| &p.name == provider_name);
+            if !exists {
+                return Err(format!(
+                    "DNS provider '{}' not found. Create it first under /api/acme/providers.",
+                    provider_name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl BalancerSupervisor {
@@ -1022,13 +1165,21 @@ async fn run_http_listener(
     );
 
     let router = Router::new().fallback(proxy_http).with_state(state);
-    if config.acme.is_some() {
+    if let Some(acme) = config.acme.clone() {
         let dir = std::env::var("BALOR_ACME_CHALLENGE_DIR")
             .unwrap_or_else(|_| "data/acme-challenges".to_string());
-        info!(
-            "ACME HTTP-01 responder active for '{}' (challenge dir: {})",
-            config.name, dir
-        );
+        match acme.challenge {
+            AcmeChallenge::Http01 => info!(
+                "ACME HTTP-01 responder active for '{}' (challenge dir: {})",
+                config.name, dir
+            ),
+            AcmeChallenge::Dns01 => info!(
+                "ACME DNS-01 configured for '{}' using provider {:?} (challenge dir still serves HTTP-01 tokens if present at {})",
+                config.name,
+                acme.provider,
+                dir
+            ),
+        }
     }
     info!(
         "Starting HTTP balancer '{}' on {} -> {} upstreams",

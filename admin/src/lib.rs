@@ -27,6 +27,33 @@ enum StickyStrategy {
     IpHash,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum AcmeChallenge {
+    Http01,
+    Dns01,
+}
+
+impl Default for AcmeChallenge {
+    fn default() -> Self {
+        AcmeChallenge::Http01
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum DnsProvider {
+    Cloudflare,
+    Route53,
+    Generic,
+}
+
+impl Default for DnsProvider {
+    fn default() -> Self {
+        DnsProvider::Cloudflare
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Role {
@@ -60,6 +87,36 @@ struct TlsConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct AcmeConfig {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    directory_url: Option<String>,
+    #[serde(default)]
+    cache_dir: Option<String>,
+    #[serde(default)]
+    challenge: AcmeChallenge,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct AcmeProviderConfig {
+    name: String,
+    provider: DnsProvider,
+    #[serde(default)]
+    api_token: Option<String>,
+    #[serde(default)]
+    access_key: Option<String>,
+    #[serde(default)]
+    secret_key: Option<String>,
+    #[serde(default)]
+    zone: Option<String>,
+    #[serde(default)]
+    txt_prefix: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct Upstream {
     id: Uuid,
     name: String,
@@ -80,6 +137,8 @@ struct Listener {
     tls: Option<TlsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sticky: Option<StickyConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme: Option<AcmeConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -99,6 +158,8 @@ struct ListenerPayload {
     tls: Option<TlsConfig>,
     #[serde(default)]
     sticky: Option<StickyConfig>,
+    #[serde(default)]
+    acme: Option<AcmeConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -142,6 +203,9 @@ fn app() -> Html {
     let users = use_state(Vec::<User>::new);
     let user_form = use_state(UserForm::default);
     let login_form = use_state(LoginForm::default);
+    let acme_providers = use_state(Vec::<AcmeProviderConfig>::new);
+    let acme_form = use_state(AcmeProviderForm::default);
+    let acme_status = use_state(StatusLine::default);
 
     let handle_error = {
         let session = session.clone();
@@ -169,10 +233,14 @@ fn app() -> Html {
         let session = session.clone();
         let handle_error = handle_error.clone();
         let metrics_rows = metrics_rows.clone();
+        let acme_providers_state = acme_providers.clone();
+        let handle_error_acme = handle_error.clone();
         use_effect_with((*tab).clone(), move |current_tab: &Tab| {
             let metrics_text = metrics_text.clone();
             let metrics_rows = metrics_rows.clone();
             let session = session.clone();
+            let acme_providers = acme_providers_state.clone();
+            let handle_error_acme = handle_error_acme.clone();
             if *current_tab == Tab::Metrics {
                 spawn_local(async move {
                     if session.is_none() {
@@ -186,6 +254,17 @@ fn app() -> Html {
                         Err(err) => handle_error(err),
                     }
                 });
+            } else if *current_tab == Tab::Acme {
+                spawn_local(async move {
+                    if let Some(sess) = session.as_ref() {
+                        if sess.role == Role::Admin {
+                            match api_acme_providers().await {
+                                Ok(list) => acme_providers.set(list),
+                                Err(err) => handle_error_acme(err),
+                            }
+                        }
+                    }
+                });
             }
             || ()
         });
@@ -197,6 +276,7 @@ fn app() -> Html {
         let loading = loading.clone();
         let session = session.clone();
         let users = users.clone();
+        let acme_providers = acme_providers.clone();
         let handle_error = handle_error.clone();
         let status = status.clone();
         use_effect_with((*session).clone(), move |current: &Option<Session>| {
@@ -217,6 +297,9 @@ fn app() -> Html {
                     if session.role == Role::Admin {
                         if let Ok(u) = api_users().await {
                             users.set(u);
+                        }
+                        if let Ok(p) = api_acme_providers().await {
+                            acme_providers.set(p);
                         }
                     }
                     loading.set(false);
@@ -494,15 +577,26 @@ fn app() -> Html {
                             if current_session.role == Role::Admin {
                                 let tab = tab.clone();
                                 html!{
-                                    <button
-                                        type="button"
-                                        class={classes!("ghost", if *tab == Tab::Users { "pill-on" } else { "" })}
-                                        onclick={{
-                                            let tab = tab.clone();
-                                            Callback::from(move |_| tab.set(Tab::Users))
-                                        }}
-                                        aria-label="Users"
-                                    >{"Users"}</button>
+                                    <>
+                                        <button
+                                            type="button"
+                                            class={classes!("ghost", if *tab == Tab::Users { "pill-on" } else { "" })}
+                                            onclick={{
+                                                let tab = tab.clone();
+                                                Callback::from(move |_| tab.set(Tab::Users))
+                                            }}
+                                            aria-label="Users"
+                                        >{"Users"}</button>
+                                        <button
+                                            type="button"
+                                            class={classes!("ghost", if *tab == Tab::Acme { "pill-on" } else { "" })}
+                                            onclick={{
+                                                let tab = tab.clone();
+                                                Callback::from(move |_| tab.set(Tab::Acme))
+                                            }}
+                                            aria-label="ACME"
+                                        >{"ACME"}</button>
+                                    </>
                                 }
                             } else { html!{} }
                         }
@@ -533,6 +627,7 @@ fn app() -> Html {
                     Tab::Listeners => "listeners",
                     Tab::Metrics => "metrics",
                     Tab::Users => "users",
+                    Tab::Acme => "acme",
                 }
             }>
                 { match *tab {
@@ -584,6 +679,12 @@ fn app() -> Html {
                                                         next.tls_enabled = false;
                                                         next.cert_path.clear();
                                                         next.key_path.clear();
+                                                        next.acme_enabled = false;
+                                                        next.acme_email.clear();
+                                                        next.acme_directory.clear();
+                                                        next.acme_cache.clear();
+                                                        next.acme_challenge = AcmeChallenge::Http01;
+                                                        next.acme_provider.clear();
                                                         next.sticky = StickyMode::None;
                                                     }
                                                     form.set(next);
@@ -649,6 +750,9 @@ fn app() -> Html {
                                                                     Callback::from(move |e: Event| {
                                                                         let mut next = (*form).clone();
                                                                         next.tls_enabled = checkbox_checked(&e);
+                                                                        if next.tls_enabled {
+                                                                            next.acme_enabled = false;
+                                                                        }
                                                                         form.set(next);
                                                                     })
                                                                 }}
@@ -712,6 +816,146 @@ fn app() -> Html {
                                                             html!{}
                                                         }
                                                     }
+                                                </>
+                                            }
+                                        } else {
+                                            html!{}
+                                        }
+                                    }
+                                    {
+                                        if form.protocol == Protocol::Http {
+                                            html!{
+                                                <>
+                                                    <label class="field">
+                                                        <span>{"ACME (Let's Encrypt) automation"}</span>
+                                                        <div class="inline">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={form.acme_enabled}
+                                                                onchange={{
+                                                                    let form = form.clone();
+                                                                    Callback::from(move |e: Event| {
+                                                                    let mut next = (*form).clone();
+                                                                    next.acme_enabled = checkbox_checked(&e);
+                                                                    if next.acme_enabled {
+                                                                        next.tls_enabled = false;
+                                                                        next.acme_challenge = AcmeChallenge::Http01;
+                                                                    }
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                            aria-label="Enable ACME automation"
+                                                        />
+                                                        <p class="hint">{"Serve HTTP-01 challenges and provision certs automatically (PEM reload pipeline pending)."}</p>
+                                                    </div>
+                                                    </label>
+                                                    <label class="field">
+                                                        <span>{"ACME challenge type"}</span>
+                                                        <select
+                                                            disabled={!form.acme_enabled}
+                                                            onchange={{
+                                                                let form = form.clone();
+                                                                let acme_providers = acme_providers.clone();
+                                                                Callback::from(move |e: Event| {
+                                                                    let mut next = (*form).clone();
+                                                                    let value = select_value(&e).unwrap_or_else(|| "http01".into());
+                                                                    next.acme_challenge = if value == "dns01" { AcmeChallenge::Dns01 } else { AcmeChallenge::Http01 };
+                                                                    if next.acme_challenge == AcmeChallenge::Http01 {
+                                                                        next.acme_provider.clear();
+                                                                    } else if next.acme_provider.is_empty() {
+                                                                        if let Some(first) = acme_providers.get(0) {
+                                                                            next.acme_provider = first.name.clone();
+                                                                        }
+                                                                    }
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                        >
+                                                            <option value="http01" selected={form.acme_challenge == AcmeChallenge::Http01}>{"HTTP-01 (default)"}</option>
+                                                            <option value="dns01" selected={form.acme_challenge == AcmeChallenge::Dns01}>{"DNS-01 (needs provider)"}</option>
+                                                        </select>
+                                                    </label>
+                                                    {
+                                                        if form.acme_enabled && form.acme_challenge == AcmeChallenge::Dns01 {
+                                                            let providers = (*acme_providers).clone();
+                                                            html!{
+                                                                <label class="field">
+                                                                    <span>{"DNS provider"}</span>
+                                                                    <select
+                                                                        onchange={{
+                                                                            let form = form.clone();
+                                                                            Callback::from(move |e: Event| {
+                                                                                let mut next = (*form).clone();
+                                                                                next.acme_provider = select_value(&e).unwrap_or_default();
+                                                                                form.set(next);
+                                                                            })
+                                                                        }}
+                                                                    >
+                                                                        {
+                                                                            if providers.is_empty() {
+                                                                                html!{<option value="" selected=true>{"No providers configured"}</option>}
+                                                                            } else {
+                                                                                html!{}
+                                                                            }
+                                                                        }
+                                                                        { for providers.iter().map(|p| {
+                                                                            let selected = form.acme_provider == p.name;
+                                                                            html!{<option value={p.name.clone()} selected={selected}>{format!("{} ({:?})", p.name, p.provider)}</option>}
+                                                                        }) }
+                                                                    </select>
+                                                                    <p class="hint">{"Configure providers in the ACME tab."}</p>
+                                                                </label>
+                                                            }
+                                                        } else { html!{} }
+                                                    }
+                                                    <label class="field">
+                                                        <span>{"Contact email (optional)"}</span>
+                                                        <input
+                                                            value={form.acme_email.clone()}
+                                                            disabled={!form.acme_enabled}
+                                                            oninput={{
+                                                                let form = form.clone();
+                                                                Callback::from(move |e: InputEvent| {
+                                                                    let mut next = (*form).clone();
+                                                                    next.acme_email = event_value(&e);
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                            placeholder="ops@example.com"
+                                                        />
+                                                    </label>
+                                                    <label class="field">
+                                                        <span>{"Directory URL (optional override)"}</span>
+                                                        <input
+                                                            value={form.acme_directory.clone()}
+                                                            disabled={!form.acme_enabled}
+                                                            oninput={{
+                                                                let form = form.clone();
+                                                                Callback::from(move |e: InputEvent| {
+                                                                    let mut next = (*form).clone();
+                                                                    next.acme_directory = event_value(&e);
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                            placeholder="https://acme-v02.api.letsencrypt.org/directory"
+                                                        />
+                                                    </label>
+                                                    <label class="field">
+                                                        <span>{"Cache dir (optional override)"}</span>
+                                                        <input
+                                                            value={form.acme_cache.clone()}
+                                                            disabled={!form.acme_enabled}
+                                                            oninput={{
+                                                                let form = form.clone();
+                                                                Callback::from(move |e: InputEvent| {
+                                                                    let mut next = (*form).clone();
+                                                                    next.acme_cache = event_value(&e);
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                            placeholder="data/acme-challenges"
+                                                        />
+                                                    </label>
                                                 </>
                                             }
                                         } else {
@@ -834,6 +1078,212 @@ fn app() -> Html {
                                     html!{<p class="muted">{"Waiting for metrics scrape..."}</p>}
                                 }
                             }
+                        </section>
+                    },
+                    Tab::Acme => html! {
+                        <section class="panel" key="acme-pane">
+                            <div class="panel-head">
+                                <div>
+                                    <p class="eyebrow">{"ACME Automation"}</p>
+                                    <h2>{"DNS providers & challenge settings"}</h2>
+                                    <p class="muted">{"Configure DNS providers for DNS-01 challenges. HTTP-01 tokens are served automatically from the challenge directory."}</p>
+                                </div>
+                                <StatusBadge status={(*acme_status).clone()} />
+                            </div>
+                            <form class="form-grid" onsubmit={{
+                                let acme_form = acme_form.clone();
+                                let acme_providers = acme_providers.clone();
+                                let acme_status = acme_status.clone();
+                                let handle_error = handle_error.clone();
+                                Callback::from(move |e: SubmitEvent| {
+                                    e.prevent_default();
+                                    let payload = (*acme_form).clone().into_config();
+                                    let acme_providers = acme_providers.clone();
+                                    let acme_status = acme_status.clone();
+                                    let handle_error = handle_error.clone();
+                                    spawn_local(async move {
+                                        match api_upsert_acme_provider(payload).await {
+                                            Ok(saved) => {
+                                                let mut list = (*acme_providers).clone();
+                                                if let Some(pos) = list.iter().position(|p| p.name == saved.name) {
+                                                    list[pos] = saved.clone();
+                                                } else {
+                                                    list.push(saved.clone());
+                                                }
+                                                acme_providers.set(list);
+                                                acme_status.set(StatusLine::success("Saved ACME provider"));
+                                            }
+                                            Err(err) => handle_error(err),
+                                        }
+                                    });
+                                })
+                            }}>
+                                <label class="field">
+                                    <span>{"Provider name"}</span>
+                                    <input
+                                        value={acme_form.name.clone()}
+                                        oninput={{
+                                            let acme_form = acme_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*acme_form).clone();
+                                                next.name = event_value(&e);
+                                                acme_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="prod-cloudflare"
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>{"Provider type"}</span>
+                                    <select onchange={{
+                                        let acme_form = acme_form.clone();
+                                        Callback::from(move |e: Event| {
+                                            let mut next = (*acme_form).clone();
+                                            let val = select_value(&e).unwrap_or_else(|| "cloudflare".into());
+                                            next.provider = match val.as_str() {
+                                                "route53" => DnsProvider::Route53,
+                                                "generic" => DnsProvider::Generic,
+                                                _ => DnsProvider::Cloudflare,
+                                            };
+                                            acme_form.set(next);
+                                        })
+                                    }}>
+                                        <option value="cloudflare" selected={acme_form.provider == DnsProvider::Cloudflare}>{"Cloudflare"}</option>
+                                        <option value="route53" selected={acme_form.provider == DnsProvider::Route53}>{"AWS Route53"}</option>
+                                        <option value="generic" selected={acme_form.provider == DnsProvider::Generic}>{"Generic (token-based)"}</option>
+                                    </select>
+                                </label>
+                                <label class="field">
+                                    <span>{"API token (use for Cloudflare / generic)"}</span>
+                                    <input
+                                        value={acme_form.api_token.clone()}
+                                        oninput={{
+                                            let acme_form = acme_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*acme_form).clone();
+                                                next.api_token = event_value(&e);
+                                                acme_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="cf_pat_..."
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>{"Access key (Route53)"}</span>
+                                    <input
+                                        value={acme_form.access_key.clone()}
+                                        oninput={{
+                                            let acme_form = acme_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*acme_form).clone();
+                                                next.access_key = event_value(&e);
+                                                acme_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="AKIA..."
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>{"Secret key (Route53)"}</span>
+                                    <input
+                                        value={acme_form.secret_key.clone()}
+                                        oninput={{
+                                            let acme_form = acme_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*acme_form).clone();
+                                                next.secret_key = event_value(&e);
+                                                acme_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="******"
+                                        type="password"
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>{"Zone / domain (optional)"}</span>
+                                    <input
+                                        value={acme_form.zone.clone()}
+                                        oninput={{
+                                            let acme_form = acme_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*acme_form).clone();
+                                                next.zone = event_value(&e);
+                                                acme_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="example.com"
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>{"TXT prefix"}</span>
+                                    <input
+                                        value={acme_form.txt_prefix.clone()}
+                                        oninput={{
+                                            let acme_form = acme_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*acme_form).clone();
+                                                next.txt_prefix = event_value(&e);
+                                                acme_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="_acme-challenge"
+                                    />
+                                </label>
+                                <div class="actions">
+                                    <button class="primary" type="submit">{"Save provider"}</button>
+                                    <button class="ghost" type="button" onclick={{
+                                        let acme_form = acme_form.clone();
+                                        Callback::from(move |_| acme_form.set(AcmeProviderForm::default()))
+                                    }}>{"Clear"}</button>
+                                </div>
+                            </form>
+                            <div class="cards">
+                                { for acme_providers.iter().map(|p| {
+                                    let acme_providers = acme_providers.clone();
+                                    let acme_form = acme_form.clone();
+                                    let acme_status = acme_status.clone();
+                                    let handle_error = handle_error.clone();
+                                    let name = p.name.clone();
+                                    html!{
+                                        <article class="card">
+                                            <div class="card-head">
+                                                <div>
+                                                    <p class="eyebrow">{format!("{:?}", p.provider)}</p>
+                                                    <h3>{ &p.name }</h3>
+                                                    <p class="muted mono">{p.zone.clone().unwrap_or_else(|| "Any zone".into())}</p>
+                                                </div>
+                                                <div class="pill-row">
+                                                    <button class="ghost" type="button" onclick={{
+                                                        let p = p.clone();
+                                                        Callback::from(move |_| acme_form.set(AcmeProviderForm::from_config(&p)))
+                                                    }}>{"Edit"}</button>
+                                                    <button class="ghost" type="button" onclick={Callback::from(move |_| {
+                                                        let acme_providers = acme_providers.clone();
+                                                        let acme_status = acme_status.clone();
+                                                        let handle_error = handle_error.clone();
+                                                        let name = name.clone();
+                                                        spawn_local(async move {
+                                                            match api_delete_acme_provider(name.clone()).await {
+                                                                Ok(_) => {
+                                                                    let filtered: Vec<_> = acme_providers.iter().cloned().filter(|x| x.name != name).collect();
+                                                                    acme_providers.set(filtered);
+                                                                    acme_status.set(StatusLine::success("Deleted provider"));
+                                                                }
+                                                                Err(err) => handle_error(err),
+                                                            }
+                                                        });
+                                                    })}>{"Delete"}</button>
+                                                </div>
+                                            </div>
+                                            <div class="pill-row">
+                                                { if let Some(zone) = &p.zone { html!{<span class="pill pill-ghost">{format!("Zone {}", zone)}</span>} } else { html!{} } }
+                                                { if let Some(prefix) = &p.txt_prefix { html!{<span class="pill pill-ghost">{format!("TXT {}", prefix)}</span>} } else { html!{} } }
+                                            </div>
+                                        </article>
+                                    }
+                                }) }
+                                { if acme_providers.is_empty() { html!{<p class="muted">{"No ACME DNS providers configured."}</p>} } else { html!{} } }
+                            </div>
                         </section>
                     },
                     Tab::Users => html! {
@@ -1023,6 +1473,13 @@ fn render_listener(
                     }
                 }
                 {
+                    if listener.acme.is_some() {
+                        html! { <span class="pill pill-ghost">{"ACME"}</span> }
+                    } else {
+                        html! {}
+                    }
+                }
+                {
                     match &listener.sticky {
                         Some(StickyConfig { strategy: StickyStrategy::Cookie, .. }) => html!{ <span class="pill pill-on">{"Sticky: Cookie"}</span> },
                         Some(StickyConfig { strategy: StickyStrategy::IpHash, .. }) => html!{ <span class="pill pill-on">{"Sticky: IP hash"}</span> },
@@ -1057,6 +1514,12 @@ struct ListenerForm {
     tls_enabled: bool,
     cert_path: String,
     key_path: String,
+    acme_enabled: bool,
+    acme_email: String,
+    acme_directory: String,
+    acme_cache: String,
+    acme_challenge: AcmeChallenge,
+    acme_provider: String,
     sticky: StickyMode,
     cookie_name: String,
 }
@@ -1066,6 +1529,7 @@ enum Tab {
     Listeners,
     Users,
     Metrics,
+    Acme,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1079,6 +1543,17 @@ struct UserForm {
     username: String,
     password: String,
     role: Role,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AcmeProviderForm {
+    name: String,
+    provider: DnsProvider,
+    api_token: String,
+    access_key: String,
+    secret_key: String,
+    zone: String,
+    txt_prefix: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1098,8 +1573,57 @@ impl Default for ListenerForm {
             tls_enabled: false,
             cert_path: String::new(),
             key_path: String::new(),
+            acme_enabled: false,
+            acme_email: String::new(),
+            acme_directory: String::new(),
+            acme_cache: String::new(),
+            acme_challenge: AcmeChallenge::Http01,
+            acme_provider: String::new(),
             sticky: StickyMode::None,
             cookie_name: String::from("BALOR_STICKY"),
+        }
+    }
+}
+
+impl Default for AcmeProviderForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            provider: DnsProvider::Cloudflare,
+            api_token: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            zone: String::new(),
+            txt_prefix: "_acme-challenge".into(),
+        }
+    }
+}
+
+impl AcmeProviderForm {
+    fn from_config(cfg: &AcmeProviderConfig) -> Self {
+        Self {
+            name: cfg.name.clone(),
+            provider: cfg.provider.clone(),
+            api_token: cfg.api_token.clone().unwrap_or_default(),
+            access_key: cfg.access_key.clone().unwrap_or_default(),
+            secret_key: cfg.secret_key.clone().unwrap_or_default(),
+            zone: cfg.zone.clone().unwrap_or_default(),
+            txt_prefix: cfg
+                .txt_prefix
+                .clone()
+                .unwrap_or_else(|| "_acme-challenge".into()),
+        }
+    }
+
+    fn into_config(self) -> AcmeProviderConfig {
+        AcmeProviderConfig {
+            name: self.name,
+            provider: self.provider,
+            api_token: (!self.api_token.trim().is_empty()).then(|| self.api_token),
+            access_key: (!self.access_key.trim().is_empty()).then(|| self.access_key),
+            secret_key: (!self.secret_key.trim().is_empty()).then(|| self.secret_key),
+            zone: (!self.zone.trim().is_empty()).then(|| self.zone),
+            txt_prefix: (!self.txt_prefix.trim().is_empty()).then(|| self.txt_prefix),
         }
     }
 }
@@ -1151,6 +1675,27 @@ impl ListenerForm {
             (StickyMode::None, "BALOR_STICKY".to_string())
         };
 
+        let (acme_enabled, acme_email, acme_directory, acme_cache, acme_challenge, acme_provider) =
+            if let Some(acme) = &listener.acme {
+                (
+                    true,
+                    acme.email.clone().unwrap_or_default(),
+                    acme.directory_url.clone().unwrap_or_default(),
+                    acme.cache_dir.clone().unwrap_or_default(),
+                    acme.challenge.clone(),
+                    acme.provider.clone().unwrap_or_default(),
+                )
+            } else {
+                (
+                    false,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    AcmeChallenge::Http01,
+                    String::new(),
+                )
+            };
+
         Self {
             name: listener.name.clone(),
             listen: listener.listen.clone(),
@@ -1159,6 +1704,12 @@ impl ListenerForm {
             tls_enabled,
             cert_path,
             key_path,
+            acme_enabled,
+            acme_email,
+            acme_directory,
+            acme_cache,
+            acme_challenge,
+            acme_provider,
             sticky,
             cookie_name,
         }
@@ -1185,12 +1736,32 @@ impl ListenerForm {
         }
 
         let tls = if self.tls_enabled && self.protocol == Protocol::Http {
+            if self.acme_enabled {
+                return Err("Choose either ACME automation or TLS PEM paths, not both".into());
+            }
             if self.cert_path.trim().is_empty() || self.key_path.trim().is_empty() {
                 return Err("Provide TLS cert and key paths".into());
             }
             Some(TlsConfig {
                 cert_path: self.cert_path.clone(),
                 key_path: self.key_path.clone(),
+            })
+        } else {
+            None
+        };
+
+        let acme = if self.acme_enabled && self.protocol == Protocol::Http {
+            if self.acme_challenge == AcmeChallenge::Dns01 && self.acme_provider.trim().is_empty() {
+                return Err("DNS-01 requires a DNS provider name".into());
+            }
+            Some(AcmeConfig {
+                email: (!self.acme_email.trim().is_empty()).then(|| self.acme_email.clone()),
+                directory_url: (!self.acme_directory.trim().is_empty())
+                    .then(|| self.acme_directory.clone()),
+                cache_dir: (!self.acme_cache.trim().is_empty()).then(|| self.acme_cache.clone()),
+                challenge: self.acme_challenge.clone(),
+                provider: (!self.acme_provider.trim().is_empty())
+                    .then(|| self.acme_provider.clone()),
             })
         } else {
             None
@@ -1224,6 +1795,7 @@ impl ListenerForm {
             upstreams,
             tls,
             sticky,
+            acme,
         })
     }
 }
@@ -1511,6 +2083,39 @@ async fn api_delete_user(id: Uuid) -> Result<(), String> {
             .await
             .unwrap_or_else(|_| "<unable to read body>".into());
         Err(format!("{status}: {body}"))
+    }
+}
+
+async fn api_acme_providers() -> Result<Vec<AcmeProviderConfig>, String> {
+    let resp = with_auth(Request::get("/api/acme/providers"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<Vec<AcmeProviderConfig>>(resp).await
+}
+
+async fn api_upsert_acme_provider(
+    payload: AcmeProviderConfig,
+) -> Result<AcmeProviderConfig, String> {
+    let resp = with_auth(Request::post("/api/acme/providers"))
+        .json(&payload)
+        .map_err(|e| format!("serialize: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<AcmeProviderConfig>(resp).await
+}
+
+async fn api_delete_acme_provider(name: String) -> Result<(), String> {
+    let url = format!("/api/acme/providers/{name}");
+    let resp = with_auth(Request::delete(&url))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(format!("delete failed: {}", resp.status()))
     }
 }
 
