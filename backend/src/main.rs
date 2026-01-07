@@ -9,6 +9,7 @@ use argon2::{
 use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, Path, State},
+    http::HeaderValue,
     http::{header, HeaderName, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -1153,7 +1154,10 @@ async fn proxy_http(
         .header("x-forwarded-proto", client_proto)
         .header(
             "x-forwarded-host",
-            client_host.unwrap_or_else(|| upstream_host.clone()),
+            client_host
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| upstream_host.clone()),
         );
 
     let response = match builder.body(body_bytes).send().await {
@@ -1180,9 +1184,16 @@ async fn proxy_http(
 
     let mut resp_builder = Response::builder().status(status);
     for (key, value) in headers.iter() {
-        if !is_hop_by_hop(key) {
-            resp_builder = resp_builder.header(key, value);
+        if is_hop_by_hop(key) {
+            continue;
         }
+        if key == &header::SET_COOKIE {
+            if let Some(rewritten) = rewrite_set_cookie(value, &upstream_host, &client_host) {
+                resp_builder = resp_builder.header(key, rewritten);
+            }
+            continue;
+        }
+        resp_builder = resp_builder.header(key, value);
     }
 
     if let Some((name, value)) = selection.set_cookie {
@@ -1383,6 +1394,32 @@ fn websocket_accept(key: &str) -> String {
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let digest = hasher.finalize();
     BASE64_STD.encode(digest)
+}
+
+fn rewrite_set_cookie(
+    value: &HeaderValue,
+    upstream_host: &str,
+    client_host: &Option<String>,
+) -> Option<HeaderValue> {
+    let Ok(raw) = value.to_str() else {
+        return Some(value.clone());
+    };
+    if upstream_host.is_empty() {
+        return Some(value.clone());
+    }
+    let replacement = client_host.clone().unwrap_or_default();
+    let mut out = raw.to_string();
+    if !replacement.is_empty() {
+        out = out.replace(
+            &format!("Domain={}", upstream_host),
+            &format!("Domain={}", replacement),
+        );
+    } else {
+        out = out.replace(&format!("Domain={}", upstream_host), "Domain");
+    }
+    HeaderValue::from_str(&out)
+        .ok()
+        .or_else(|| Some(value.clone()))
 }
 
 #[derive(Clone)]

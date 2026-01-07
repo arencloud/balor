@@ -83,6 +83,7 @@ Environment knobs:
 - Background health checks run every ~5 seconds and mark upstreams up/down in the UI automatically.
 - HTTP listeners can terminate TLS via PEM cert/key paths; files are reloaded when they change.
 - Sticky sessions supported per HTTP listener (cookie or client IP hash).
+- Upstream `Set-Cookie` domains are rewritten to the client-facing host to keep sessions alive across refreshes when proxied.
 - RBAC roles: Admin (full), Operator (CRUD listeners), Viewer (read-only).
 - Prometheus metrics exposed at `/metrics` (HTTP counters/latency and TCP connection totals per listener).
 - WebSocket pass-through supported for HTTP listeners (upgrade + bidirectional frames).
