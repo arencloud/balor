@@ -16,6 +16,10 @@ use axum::{
     Extension, Json, Router,
 };
 use axum_server::{tls_rustls::RustlsConfig, Handle};
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine;
+use futures::{SinkExt, StreamExt};
+use hyper_util::rt::TokioIo;
 use parking_lot::RwLock;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
@@ -23,6 +27,7 @@ use prometheus::{
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use std::{
     collections::hash_map::DefaultHasher,
     collections::HashMap,
@@ -42,6 +47,7 @@ use tokio::{
     task::JoinHandle,
     time,
 };
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Role as WsRole, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -1101,12 +1107,21 @@ async fn proxy_http(
         }
     };
     let upstream = selection.upstream;
+    if is_websocket(&request) {
+        return proxy_websocket(request, upstream, peer).await;
+    }
     let path = request
         .uri()
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    let target_url = format!("{}{}", upstream.address, path);
+    let (upstream_base, upstream_prefix, upstream_host) = split_upstream(&upstream.address);
+    let suffix = if !upstream_prefix.is_empty() && path.starts_with(&upstream_prefix) {
+        path.strip_prefix(&upstream_prefix).unwrap_or(path)
+    } else {
+        path
+    };
+    let target_url = format!("{}{}", upstream_base, suffix);
 
     let (parts, body) = request.into_parts();
     let body_bytes = to_bytes(body, BODY_LIMIT)
@@ -1114,11 +1129,32 @@ async fn proxy_http(
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
     let mut builder = state.client.request(parts.method.clone(), target_url);
+    let client_ip = peer.ip().to_string();
+    let client_proto = if upstream.address.starts_with("https") {
+        "https"
+    } else {
+        "http"
+    };
+    let client_host = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     for (key, value) in parts.headers.iter() {
-        if !is_hop_by_hop(key) {
+        if !is_hop_by_hop(key) && key != &header::HOST {
             builder = builder.header(key, value);
         }
     }
+    if !upstream_host.is_empty() {
+        builder = builder.header(header::HOST, upstream_host.clone());
+    }
+    builder = builder
+        .header("x-forwarded-for", client_ip)
+        .header("x-forwarded-proto", client_proto)
+        .header(
+            "x-forwarded-host",
+            client_host.unwrap_or_else(|| upstream_host.clone()),
+        );
 
     let response = match builder.body(body_bytes).send().await {
         Ok(resp) => resp,
@@ -1165,6 +1201,130 @@ async fn proxy_http(
     Ok(body)
 }
 
+async fn proxy_websocket(
+    mut request: Request<Body>,
+    upstream: Upstream,
+    peer: SocketAddr,
+) -> Result<Response<Body>, StatusCode> {
+    let path_str = request
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let (upstream_base, upstream_prefix, upstream_host) = split_upstream(&upstream.address);
+    let suffix = if !upstream_prefix.is_empty() && path_str.starts_with(&upstream_prefix) {
+        path_str.strip_prefix(&upstream_prefix).unwrap_or(path_str)
+    } else {
+        path_str
+    };
+    let scheme = if upstream.address.starts_with("https") {
+        "wss"
+    } else {
+        "ws"
+    };
+    let ws_target = format!("{}{}", upstream_base.replacen("http", scheme, 1), suffix);
+
+    let upgrade = hyper::upgrade::on(&mut request);
+    let _client_ip_ws = peer.ip().to_string();
+    let accept_key = request
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|k| websocket_accept(k));
+
+    let mut response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, "websocket");
+    if let Some(key) = accept_key {
+        response = response.header(header::SEC_WEBSOCKET_ACCEPT, key);
+    }
+    let response = response
+        .body(Body::empty())
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    tokio::spawn(async move {
+        let upgraded = match upgrade.await {
+            Ok(up) => up,
+            Err(err) => {
+                warn!("websocket upgrade failed: {err}");
+                return;
+            }
+        };
+
+        let upgraded = TokioIo::new(upgraded);
+        let client_ws: WebSocketStream<_> =
+            WebSocketStream::from_raw_socket(upgraded, WsRole::Server, None).await;
+
+        let mut req_builder = Request::builder().method("GET").uri(&ws_target);
+        for (key, value) in request.headers().iter() {
+            if key == header::HOST {
+                continue;
+            }
+            if key == header::SEC_WEBSOCKET_EXTENSIONS {
+                // Avoid negotiating compression; pass-through without RSV bits issues.
+                continue;
+            }
+            req_builder = req_builder.header(key, value);
+        }
+        req_builder = req_builder.header(header::HOST, upstream_host);
+        let request = req_builder.body(()).unwrap_or_else(|_| Request::new(()));
+
+        let upstream_ws = connect_async(request).await;
+        let (upstream_ws, _) = match upstream_ws {
+            Ok(res) => res,
+            Err(err) => {
+                warn!("upstream websocket connect failed: {err}");
+                return;
+            }
+        };
+
+        let (mut client_write, mut client_read) = client_ws.split();
+        let (mut upstream_write, mut upstream_read) = upstream_ws.split();
+
+        let c_to_u = async {
+            while let Some(msg) = client_read.next().await {
+                match msg {
+                    Ok(msg) => {
+                        if let Err(err) = upstream_write.send(msg).await {
+                            warn!("ws forward client->upstream failed: {err}");
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        warn!("ws read client error: {err}");
+                        break;
+                    }
+                }
+            }
+        };
+
+        let u_to_c = async {
+            while let Some(msg) = upstream_read.next().await {
+                match msg {
+                    Ok(msg) => {
+                        if let Err(err) = client_write.send(msg).await {
+                            warn!("ws forward upstream->client failed: {err}");
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        warn!("ws read upstream error: {err}");
+                        break;
+                    }
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = c_to_u => (),
+            _ = u_to_c => (),
+        }
+    });
+
+    Ok(response)
+}
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -1177,6 +1337,52 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn is_websocket(req: &Request<Body>) -> bool {
+    let upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let connection = req
+        .headers()
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    upgrade || connection.contains("upgrade")
+}
+
+fn split_upstream(address: &str) -> (String, String, String) {
+    let trimmed = address.trim_end_matches('/');
+    let mut host = String::new();
+    let mut base = trimmed.to_string();
+    let mut prefix = String::new();
+
+    if let Some(idx) = trimmed.find("://") {
+        let rest = &trimmed[idx + 3..];
+        if let Some(slash) = rest.find('/') {
+            host = rest[..slash].to_string();
+            let path_part = &rest[slash + 1..];
+            prefix = format!("/{}", path_part);
+            base = format!("{}://{}", &trimmed[..idx], host);
+        } else {
+            host = rest.to_string();
+            base = trimmed.to_string();
+        }
+    }
+
+    (base, prefix, host)
+}
+
+fn websocket_accept(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let digest = hasher.finalize();
+    BASE64_STD.encode(digest)
 }
 
 #[derive(Clone)]

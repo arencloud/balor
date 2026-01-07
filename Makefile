@@ -35,6 +35,7 @@ fmt:
 run: ui
 	BALOR_ADMIN_DIST=$(ADMIN_DIST) \
 	BALOR_DEFAULT_ADMIN_PASSWORD=$(BALOR_DEFAULT_ADMIN_PASSWORD) \
+	RUST_LOG=debug \
 	cargo run -p backend
 
 clean:

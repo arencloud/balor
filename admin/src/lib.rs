@@ -6,6 +6,7 @@ use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::f64;
 use std::{cell::RefCell, rc::Rc};
 use uuid::Uuid;
 use wasm_bindgen::{prelude::*, JsCast};
@@ -135,6 +136,7 @@ fn app() -> Html {
     let editing = use_state(|| None::<Uuid>);
     let stats = use_state(Stats::default);
     let metrics_text = use_state(|| String::new());
+    let metrics_rows = use_state(Vec::<MetricRow>::new);
     let session = use_state(load_session);
     let tab = use_state(|| Tab::Listeners);
     let users = use_state(Vec::<User>::new);
@@ -166,8 +168,10 @@ fn app() -> Html {
         let tab = tab.clone();
         let session = session.clone();
         let handle_error = handle_error.clone();
+        let metrics_rows = metrics_rows.clone();
         use_effect_with((*tab).clone(), move |current_tab: &Tab| {
             let metrics_text = metrics_text.clone();
+            let metrics_rows = metrics_rows.clone();
             let session = session.clone();
             if *current_tab == Tab::Metrics {
                 spawn_local(async move {
@@ -175,7 +179,10 @@ fn app() -> Html {
                         return;
                     }
                     match api_metrics().await {
-                        Ok(body) => metrics_text.set(body),
+                        Ok(body) => {
+                            metrics_rows.set(parse_metrics_summary(&body));
+                            metrics_text.set(body);
+                        }
                         Err(err) => handle_error(err),
                     }
                 });
@@ -771,21 +778,24 @@ fn app() -> Html {
                                 <div class="pill-row">
                                     <button type="button" class="ghost" onclick={{
                                         let status = status.clone();
+                                    let metrics_text = metrics_text.clone();
+                                    let metrics_rows = metrics_rows.clone();
+                                    let handle_error = handle_error.clone();
+                                    Callback::from(move |_| {
+                                        let status = status.clone();
                                         let metrics_text = metrics_text.clone();
+                                        let metrics_rows = metrics_rows.clone();
                                         let handle_error = handle_error.clone();
-                                        Callback::from(move |_| {
-                                            let status = status.clone();
-                                            let metrics_text = metrics_text.clone();
-                                            let handle_error = handle_error.clone();
-                                            spawn_local(async move {
-                                                match api_metrics().await {
-                                                    Ok(body) => {
-                                                        metrics_text.set(body);
-                                                        status.set(StatusLine::success("Metrics refreshed (preview)"));
-                                                    }
-                                                    Err(err) => handle_error(err),
+                                        spawn_local(async move {
+                                            match api_metrics().await {
+                                                Ok(body) => {
+                                                    metrics_rows.set(parse_metrics_summary(&body));
+                                                    metrics_text.set(body);
+                                                    status.set(StatusLine::success("Metrics refreshed (preview)"));
                                                 }
-                                            });
+                                                Err(err) => handle_error(err),
+                                            }
+                                        });
                                         })
                                     }} aria-label="Refresh metrics">{"Refresh"}</button>
                                     <button type="button" class="ghost" onclick={Callback::from(move |_| {
@@ -798,6 +808,32 @@ fn app() -> Html {
                             <div class="metrics-block">
                                 <pre>{ (*metrics_text).clone() }</pre>
                             </div>
+                            {
+                                if !metrics_rows.is_empty() {
+                                    let max = metrics_rows.iter().fold(0f64, |m, r| m.max(r.value));
+                                    html!{
+                                        <div class="metrics-cards">
+                                            { for metrics_rows.iter().map(|row| {
+                                                let pct = if max > 0.0 { (row.value / max * 100.0).min(100.0) } else { 0.0 };
+                                                html!{
+                                                    <article class="metric-card">
+                                                        <div class="metric-head">
+                                                            <span class="pill pill-ghost mono">{ &row.listener }</span>
+                                                            <span class="pill">{ format!("{}", row.status.to_uppercase()) }</span>
+                                                        </div>
+                                                        <div class="bar">
+                                                            <div class="fill" style={format!("width:{:.1}%;", pct)}></div>
+                                                        </div>
+                                                        <p class="muted">{ format!("{:.0} requests", row.value) }</p>
+                                                    </article>
+                                                }
+                                            }) }
+                                        </div>
+                                    }
+                                } else {
+                                    html!{<p class="muted">{"Waiting for metrics scrape..."}</p>}
+                                }
+                            }
                         </section>
                     },
                     Tab::Users => html! {
@@ -1291,6 +1327,56 @@ fn clear_session_storage() {
         let _ = storage.remove_item("balor_session");
     }
     SESSION_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+#[derive(Clone, PartialEq)]
+struct MetricRow {
+    listener: String,
+    status: String,
+    value: f64,
+}
+
+fn parse_metrics_summary(body: &str) -> Vec<MetricRow> {
+    let mut rows = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if !line.starts_with("balor_http_requests_total") {
+            continue;
+        }
+        let parts: Vec<_> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let labels = parts[0];
+        let value: f64 = parts[1].parse().unwrap_or(0.0);
+
+        let (listener, status) = if let Some(start) = labels.find('{') {
+            let inner = &labels[start + 1..labels.len().saturating_sub(1)];
+            let mut listener = String::from("unknown");
+            let mut status_label = String::from("other");
+            for pair in inner.split(',') {
+                let mut kv = pair.splitn(2, '=');
+                if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                    let v = v.trim_matches('"');
+                    match k {
+                        "listener_id" => listener = v.to_string(),
+                        "status" => status_label = v.to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            (listener, status_label)
+        } else {
+            (String::from("unknown"), String::from("other"))
+        };
+
+        rows.push(MetricRow {
+            listener,
+            status,
+            value,
+        });
+    }
+    rows
 }
 
 fn with_auth(req: gloo_net::http::RequestBuilder) -> gloo_net::http::RequestBuilder {

@@ -85,5 +85,6 @@ Environment knobs:
 - Sticky sessions supported per HTTP listener (cookie or client IP hash).
 - RBAC roles: Admin (full), Operator (CRUD listeners), Viewer (read-only).
 - Prometheus metrics exposed at `/metrics` (HTTP counters/latency and TCP connection totals per listener).
+- WebSocket pass-through supported for HTTP listeners (upgrade + bidirectional frames).
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.
 - Browser support note: Chrome/Chromium render the admin dashboard fully; Firefox currently has partial support for the Users/Metrics tabs (layout issues under investigation).
