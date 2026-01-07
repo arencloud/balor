@@ -41,7 +41,7 @@ flowchart LR
 ```
 
 - **Backend (`backend`)**: Axum HTTP server exposing CRUD APIs for listeners and serving the compiled admin UI. A supervisor spawns runtime tasks per listener:
-  - **HTTP (L7)**: Axum fallback proxy with round-robin upstream selection and header sanitization.
+  - **HTTP (L7)**: Axum fallback proxy with round-robin upstream selection and header sanitization. Host-based routing is first-class: each host binds to an upstream pool and can carry its own TLS/ACME settings (SNI).
   - **TCP (L4)**: Tokio `copy_bidirectional` bridge with round-robin upstream selection.
 - **Admin UI (`admin`)**: Yew single-page app compiled to WASM via Trunk. Provides listener creation, editing, deletion, and live stats against `/api/*`. Uses the logo at `images/balor.png`.
 - **Workspace**: Cargo workspace rooted at repository top; shared dependencies declared in the workspace `[dependencies]`.
@@ -70,15 +70,16 @@ Environment knobs:
 - `GET /api/health` – service heartbeat.
 - `GET /api/stats` – listener/task counts.
 - `GET /api/listeners` – list configured listeners.
-- `POST /api/listeners` – create listener with `{ name, listen, protocol: "http"|"tcp", upstreams: [{ name, address, enabled }] }`.
+- `POST /api/listeners` – create listener. HTTP listeners now rely on host-based routes: `{ name, listen, protocol: "http"|"tcp", host_routes: [{ host, pool, tls?, acme? }], upstreams: [...] }` (TCP uses `upstreams`). Pools are referenced by name.
 - `GET /api/listeners/{id}` – fetch a listener.
 - `PUT /api/listeners/{id}` – update a listener.
 - `DELETE /api/listeners/{id}` – remove a listener and stop its runtime.
+- `GET/POST/DELETE /api/pools` – manage reusable upstream pools (attach to host routes).
 - `POST /api/login` / `POST /api/logout` – session tokens for the UI.
 - `GET/POST/PUT/DELETE /api/users` – RBAC user management (admin only).
 
 ## Notes
-- HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port.
+- HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port. HTTP host routes pick from pools (no inline upstreams in the UI).
 - State persists to `data/balor_state.json` on each change (path override via `BALOR_STATE_FILE`).
 - Background health checks run every ~5 seconds and mark upstreams up/down in the UI automatically.
 - HTTP listeners can terminate TLS via PEM cert/key paths; files are reloaded when they change.
@@ -87,7 +88,7 @@ Environment knobs:
 - RBAC roles: Admin (full), Operator (CRUD listeners), Viewer (read-only).
 - Prometheus metrics exposed at `/metrics` (HTTP counters/latency and TCP connection totals per listener).
 - WebSocket pass-through supported for HTTP listeners (upgrade + bidirectional frames).
-- ACME automation: HTTP-01 responder serves tokens from `BALOR_ACME_CHALLENGE_DIR` (default `data/acme-challenges`); DNS-01 flow supported with provider profiles (Cloudflare, Route53, generic) configurable in the Admin UI ACME tab (full issuance/renewal wiring is in progress).
+- ACME automation: HTTP-01 responder serves tokens from `BALOR_ACME_CHALLENGE_DIR` (default `data/acme-challenges`); DNS-01 flow supported with provider profiles (Cloudflare, Route53, generic) configurable in the Admin UI ACME tab (full issuance/renewal wiring is in progress). Per-host ACME is available on host routes.
 - Certificates dashboard: upload/download manual PEM bundles (stored under `BALOR_CERT_DIR`, default `data/certs`) from the Admin UI Certificates tab.
 - ACME provider type auto-sets API base URLs (Cloudflare/Route53) with overrides allowed.
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.

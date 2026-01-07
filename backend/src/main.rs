@@ -129,12 +129,20 @@ struct Upstream {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpstreamPool {
+    name: String,
+    upstreams: Vec<Upstream>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ListenerConfig {
     id: Uuid,
     name: String,
     listen: String,
     protocol: Protocol,
     upstreams: Vec<Upstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_routes: Option<Vec<HostRule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls: Option<TlsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,6 +158,8 @@ struct ListenerPayload {
     protocol: Protocol,
     upstreams: Vec<UpstreamPayload>,
     #[serde(default)]
+    host_routes: Option<Vec<HostRulePayload>>,
+    #[serde(default)]
     tls: Option<TlsPayload>,
     #[serde(default)]
     sticky: Option<StickyPayload>,
@@ -162,6 +172,36 @@ struct UpstreamPayload {
     name: String,
     address: String,
     enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpstreamPoolPayload {
+    name: String,
+    upstreams: Vec<UpstreamPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostRulePayload {
+    host: String,
+    upstreams: Vec<UpstreamPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<TlsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme: Option<AcmePayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostRule {
+    host: String,
+    upstreams: Vec<Upstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<TlsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme: Option<AcmeConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +281,8 @@ struct ConfigStore {
     acme_providers: Vec<AcmeProviderConfig>,
     #[serde(default)]
     certificates: Vec<CertificateBundle>,
+    #[serde(default)]
+    pools: Vec<UpstreamPool>,
 }
 
 struct AppContext {
@@ -511,6 +553,8 @@ async fn main() -> anyhow::Result<()> {
                     get(list_acme_providers).post(upsert_acme_provider),
                 )
                 .route("/acme/providers/:name", delete(delete_acme_provider))
+                .route("/pools", get(list_pools).post(upsert_pool))
+                .route("/pools/:name", delete(delete_pool))
                 .route("/certs", get(list_certs).post(upload_cert))
                 .route("/certs/:name", get(get_cert).delete(delete_cert))
                 .layer(middleware::from_fn_with_state(
@@ -731,6 +775,68 @@ async fn delete_acme_provider(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_pools(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<Vec<UpstreamPool>>, StatusCode> {
+    require_admin(&ctx)?;
+    let store = state.store.read();
+    Ok(Json(store.pools.clone()))
+}
+
+async fn upsert_pool(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<UpstreamPoolPayload>,
+) -> Result<Json<UpstreamPool>, StatusCode> {
+    require_admin(&ctx)?;
+    if payload.name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let upstreams = payload
+        .upstreams
+        .clone()
+        .into_iter()
+        .map(|u| u.into_upstream())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if upstreams.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let pool = UpstreamPool {
+        name: payload.name.clone(),
+        upstreams,
+    };
+    {
+        let mut store = state.store.write();
+        if let Some(existing) = store.pools.iter_mut().find(|p| p.name == payload.name) {
+            *existing = pool.clone();
+        } else {
+            store.pools.push(pool.clone());
+        }
+    }
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(pool))
+}
+
+async fn delete_pool(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    require_admin(&ctx)?;
+    {
+        let mut store = state.store.write();
+        let before = store.pools.len();
+        store.pools.retain(|p| p.name != name);
+        if before == store.pools.len() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_certs(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
@@ -921,7 +1027,12 @@ async fn create_listener(
 ) -> Result<Json<ListenerConfig>, ApiError> {
     require_operator(&ctx)?;
     let id = Uuid::new_v4();
-    let config = payload.into_config(id).map_err(ApiError::BadRequest)?;
+    let config = {
+        let store_snapshot = state.store.read();
+        payload
+            .into_config(id, &store_snapshot)
+            .map_err(ApiError::BadRequest)?
+    };
     {
         let store = state.store.read();
         validate_acme_config(&config.acme, &store).map_err(ApiError::BadRequest)?;
@@ -948,7 +1059,12 @@ async fn update_listener(
     Json(payload): Json<ListenerPayload>,
 ) -> Result<Json<ListenerConfig>, ApiError> {
     require_operator(&ctx)?;
-    let config = payload.into_config(id).map_err(ApiError::BadRequest)?;
+    let config = {
+        let store_snapshot = state.store.read();
+        payload
+            .into_config(id, &store_snapshot)
+            .map_err(ApiError::BadRequest)?
+    };
     {
         let store = state.store.read();
         validate_acme_config(&config.acme, &store).map_err(ApiError::BadRequest)?;
@@ -990,12 +1106,13 @@ async fn delete_listener(
 }
 
 impl ListenerPayload {
-    fn into_config(self, id: Uuid) -> Result<ListenerConfig, String> {
+    fn into_config(self, id: Uuid, store: &ConfigStore) -> Result<ListenerConfig, String> {
         let Self {
             name,
             listen,
             protocol,
             upstreams,
+            host_routes,
             tls,
             sticky,
             acme,
@@ -1050,8 +1167,27 @@ impl ListenerPayload {
             upstreams
         };
 
-        if upstreams.is_empty() {
+        let host_routes = if protocol == Protocol::Http {
+            host_routes
+                .map(|routes| {
+                    routes
+                        .into_iter()
+                        .map(|r| r.into_config(store))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        if protocol == Protocol::Tcp && upstreams.is_empty() {
             return Err("at least one upstream is required".into());
+        }
+        if protocol == Protocol::Http
+            && upstreams.is_empty()
+            && host_routes.as_ref().map_or(true, |r| r.is_empty())
+        {
+            return Err("at least one host route or fallback upstream is required".into());
         }
 
         Ok(ListenerConfig {
@@ -1060,6 +1196,7 @@ impl ListenerPayload {
             listen,
             protocol,
             upstreams,
+            host_routes,
             tls,
             sticky,
             acme,
@@ -1079,6 +1216,40 @@ impl UpstreamPayload {
             address: self.address,
             enabled: self.enabled,
             healthy: None,
+        })
+    }
+}
+
+impl HostRulePayload {
+    fn into_config(self, store: &ConfigStore) -> Result<HostRule, String> {
+        if self.host.trim().is_empty() {
+            return Err("host value cannot be empty".into());
+        }
+        let mut upstreams = self
+            .upstreams
+            .into_iter()
+            .map(|u| {
+                let mut upstream = u.into_upstream()?;
+                upstream.address = ensure_http_scheme(&upstream.address);
+                Ok(upstream)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if upstreams.is_empty() {
+            if let Some(pool_name) = &self.pool {
+                if let Some(pool) = store.pools.iter().find(|p| p.name == *pool_name) {
+                    upstreams.extend(pool.upstreams.clone());
+                }
+            }
+        }
+        if upstreams.is_empty() {
+            return Err("host route must include at least one upstream or pool".into());
+        }
+        Ok(HostRule {
+            host: self.host.to_lowercase(),
+            upstreams,
+            pool: self.pool.clone(),
+            tls: self.tls.map(|t| t.into_config()).transpose()?,
+            acme: self.acme.map(|a| a.into_config()).transpose()?,
         })
     }
 }
@@ -1230,6 +1401,7 @@ async fn spawn_listener(
 struct HttpProxyState {
     listener_id: Uuid,
     upstreams: Arc<Vec<Upstream>>,
+    host_routes: Arc<Vec<HostRule>>,
     position: Arc<AtomicUsize>,
     client: reqwest::Client,
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
@@ -1241,6 +1413,7 @@ impl HttpProxyState {
     fn new(
         listener_id: Uuid,
         upstreams: Vec<Upstream>,
+        host_routes: Vec<HostRule>,
         health: Arc<RwLock<HashMap<Uuid, bool>>>,
         sticky: Option<StickyConfig>,
         metrics: Arc<Metrics>,
@@ -1248,6 +1421,7 @@ impl HttpProxyState {
         Self {
             listener_id,
             upstreams: Arc::new(upstreams),
+            host_routes: Arc::new(host_routes),
             position: Arc::new(AtomicUsize::new(0)),
             client: reqwest::Client::new(),
             health,
@@ -1258,12 +1432,32 @@ impl HttpProxyState {
 
     fn next_upstream(&self, req: &Request<Body>, peer: &SocketAddr) -> Option<UpstreamSelection> {
         let health = self.health.read();
-        let enabled: Vec<_> = self
-            .upstreams
-            .iter()
-            .filter(|u| u.enabled && *health.get(&u.id).unwrap_or(&true))
-            .cloned()
-            .collect();
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|h| h.to_lowercase());
+        let enabled: Vec<_> = if let Some(h) = host {
+            if let Some(rule) = self.host_routes.iter().find(|r| r.host == h) {
+                rule.upstreams
+                    .iter()
+                    .filter(|u| u.enabled && *health.get(&u.id).unwrap_or(&true))
+                    .cloned()
+                    .collect()
+            } else {
+                self.upstreams
+                    .iter()
+                    .filter(|u| u.enabled && *health.get(&u.id).unwrap_or(&true))
+                    .cloned()
+                    .collect()
+            }
+        } else {
+            self.upstreams
+                .iter()
+                .filter(|u| u.enabled && *health.get(&u.id).unwrap_or(&true))
+                .cloned()
+                .collect()
+        };
         if enabled.is_empty() {
             return None;
         }
@@ -1332,6 +1526,7 @@ async fn run_http_listener(
     let state = HttpProxyState::new(
         config.id,
         config.upstreams.clone(),
+        config.host_routes.clone().unwrap_or_default(),
         health,
         config.sticky.clone(),
         metrics.clone(),
@@ -2114,7 +2309,13 @@ async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
     };
 
     for listener in listeners {
-        for upstream in listener.upstreams {
+        let mut all_upstreams = listener.upstreams.clone();
+        if let Some(routes) = &listener.host_routes {
+            for r in routes {
+                all_upstreams.extend(r.upstreams.clone());
+            }
+        }
+        for upstream in all_upstreams {
             let ok = match listener.protocol {
                 Protocol::Http => check_http(client, &ensure_http_scheme(&upstream.address)).await,
                 Protocol::Tcp => check_tcp(&upstream.address).await,
