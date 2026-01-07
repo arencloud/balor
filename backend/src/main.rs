@@ -27,6 +27,8 @@ use prometheus::{
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use rand_core::OsRng;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{
@@ -60,7 +62,7 @@ use uuid::Uuid;
 
 const BODY_LIMIT: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Protocol {
     Http,
@@ -213,6 +215,21 @@ struct AcmeProviderConfig {
     zone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     txt_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_base: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CertificateBundle {
+    name: String,
+    cert_path: String,
+    key_path: String,
+    #[serde(default = "default_cert_source")]
+    source: String,
+}
+
+fn default_cert_source() -> String {
+    "manual".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -222,6 +239,8 @@ struct ConfigStore {
     users: HashMap<Uuid, UserRecord>,
     #[serde(default)]
     acme_providers: Vec<AcmeProviderConfig>,
+    #[serde(default)]
+    certificates: Vec<CertificateBundle>,
 }
 
 struct AppContext {
@@ -362,6 +381,15 @@ struct UserPayload {
     password: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct CertificatePayload {
+    name: String,
+    cert_pem: String,
+    key_pem: String,
+    #[serde(default = "default_cert_source")]
+    source: String,
+}
+
 #[derive(Debug, Serialize)]
 struct UserResponse {
     id: Uuid,
@@ -425,6 +453,10 @@ impl IntoResponse for ApiError {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Err(err) = rustls::crypto::ring::default_provider().install_default() {
+        panic!("failed to install rustls crypto provider: {:?}", err);
+    }
+
     tracing_subscriber::fmt()
         .with_target(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -479,6 +511,8 @@ async fn main() -> anyhow::Result<()> {
                     get(list_acme_providers).post(upsert_acme_provider),
                 )
                 .route("/acme/providers/:name", delete(delete_acme_provider))
+                .route("/certs", get(list_certs).post(upload_cert))
+                .route("/certs/:name", get(get_cert).delete(delete_cert))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     admin_auth_guard,
@@ -697,6 +731,113 @@ async fn delete_acme_provider(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_certs(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<Vec<CertificateBundle>>, StatusCode> {
+    require_admin(&ctx)?;
+    let store = state.store.read();
+    Ok(Json(store.certificates.clone()))
+}
+
+async fn upload_cert(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<CertificatePayload>,
+) -> Result<Json<CertificateBundle>, StatusCode> {
+    require_admin(&ctx)?;
+    if payload.name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let dir = std::env::var("BALOR_CERT_DIR").unwrap_or_else(|_| "data/certs".to_string());
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cert_path = format!("{}/{}.crt", dir, payload.name);
+    let key_path = format!("{}/{}.key", dir, payload.name);
+    fs::write(&cert_path, payload.cert_pem.as_bytes())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    fs::write(&key_path, payload.key_pem.as_bytes())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let bundle = CertificateBundle {
+        name: payload.name.clone(),
+        cert_path: cert_path.clone(),
+        key_path: key_path.clone(),
+        source: payload.source.clone(),
+    };
+
+    {
+        let mut store = state.store.write();
+        if let Some(existing) = store
+            .certificates
+            .iter_mut()
+            .find(|c| c.name == payload.name)
+        {
+            *existing = bundle.clone();
+        } else {
+            store.certificates.push(bundle.clone());
+        }
+    }
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(bundle))
+}
+
+async fn get_cert(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<Json<CertificatePayload>, StatusCode> {
+    require_admin(&ctx)?;
+    let bundle = {
+        let store = state.store.read();
+        let Some(bundle) = store.certificates.iter().find(|c| c.name == name) else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        bundle.clone()
+    };
+    let cert_pem = fs::read_to_string(&bundle.cert_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let key_pem = fs::read_to_string(&bundle.key_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(CertificatePayload {
+        name: bundle.name.clone(),
+        cert_pem,
+        key_pem,
+        source: bundle.source.clone(),
+    }))
+}
+
+async fn delete_cert(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    require_admin(&ctx)?;
+    let removed_paths: Option<(String, String)> = {
+        let mut store = state.store.write();
+        if let Some(pos) = store.certificates.iter().position(|c| c.name == name) {
+            let bundle = store.certificates.remove(pos);
+            Some((bundle.cert_path, bundle.key_path))
+        } else {
+            None
+        }
+    };
+
+    let Some((cert, key)) = removed_paths else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let _ = fs::remove_file(cert).await;
+    let _ = fs::remove_file(key).await;
+    persist_store(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
@@ -897,6 +1038,18 @@ impl ListenerPayload {
             return Err("TLS paths and ACME cannot both be set; choose one".into());
         }
 
+        let upstreams = if protocol == Protocol::Http {
+            upstreams
+                .into_iter()
+                .map(|mut u| {
+                    u.address = ensure_http_scheme(&u.address);
+                    u
+                })
+                .collect()
+        } else {
+            upstreams
+        };
+
         if upstreams.is_empty() {
             return Err("at least one upstream is required".into());
         }
@@ -978,6 +1131,26 @@ fn validate_listen(listen: &str) -> Result<(), String> {
         .parse::<SocketAddr>()
         .map(|_| ())
         .map_err(|e| format!("invalid listen address {listen}: {e}"))
+}
+
+fn ensure_http_scheme(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    }
+}
+
+fn ensure_ws_scheme(addr: &str) -> String {
+    if addr.starts_with("ws://") || addr.starts_with("wss://") {
+        addr.to_string()
+    } else if addr.starts_with("http://") {
+        addr.replacen("http://", "ws://", 1)
+    } else if addr.starts_with("https://") {
+        addr.replacen("https://", "wss://", 1)
+    } else {
+        format!("ws://{}", addr)
+    }
 }
 
 fn validate_acme_config(acme: &Option<AcmeConfig>, store: &ConfigStore) -> Result<(), String> {
@@ -1189,8 +1362,7 @@ async fn run_http_listener(
     );
 
     if let Some(tls) = config.tls.clone() {
-        let tls_config =
-            RustlsConfig::from_pem_file(tls.cert_path.clone(), tls.key_path.clone()).await?;
+        let tls_config = load_rustls_config(&tls.cert_path, &tls.key_path).await?;
         info!(
             "TLS enabled for '{}' using cert={} key={}",
             config.name, tls.cert_path, tls.key_path
@@ -1330,7 +1502,8 @@ async fn proxy_http(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    let (upstream_base, upstream_prefix, upstream_host) = split_upstream(&upstream.address);
+    let (raw_base, upstream_prefix, upstream_host) = split_upstream(&upstream.address);
+    let upstream_base = ensure_http_scheme(&raw_base);
     let suffix = if !upstream_prefix.is_empty() && path.starts_with(&upstream_prefix) {
         path.strip_prefix(&upstream_prefix).unwrap_or(path)
     } else {
@@ -1436,18 +1609,14 @@ async fn proxy_websocket(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    let (upstream_base, upstream_prefix, upstream_host) = split_upstream(&upstream.address);
+    let (raw_base, upstream_prefix, upstream_host) = split_upstream(&upstream.address);
+    let upstream_base = ensure_ws_scheme(&raw_base);
     let suffix = if !upstream_prefix.is_empty() && path_str.starts_with(&upstream_prefix) {
         path_str.strip_prefix(&upstream_prefix).unwrap_or(path_str)
     } else {
         path_str
     };
-    let scheme = if upstream.address.starts_with("https") {
-        "wss"
-    } else {
-        "ws"
-    };
-    let ws_target = format!("{}{}", upstream_base.replacen("http", scheme, 1), suffix);
+    let ws_target = format!("{}{}", upstream_base, suffix);
 
     let upgrade = hyper::upgrade::on(&mut request);
     let _client_ip_ws = peer.ip().to_string();
@@ -1582,7 +1751,7 @@ fn is_websocket(req: &Request<Body>) -> bool {
 
 fn split_upstream(address: &str) -> (String, String, String) {
     let trimmed = address.trim_end_matches('/');
-    let mut host = String::new();
+    let host: String;
     let mut base = trimmed.to_string();
     let mut prefix = String::new();
 
@@ -1597,6 +1766,13 @@ fn split_upstream(address: &str) -> (String, String, String) {
             host = rest.to_string();
             base = trimmed.to_string();
         }
+    } else if let Some(slash) = trimmed.find('/') {
+        host = trimmed[..slash].to_string();
+        let path_part = &trimmed[slash + 1..];
+        prefix = format!("/{}", path_part);
+        base = host.clone();
+    } else {
+        host = trimmed.to_string();
     }
 
     (base, prefix, host)
@@ -1608,6 +1784,54 @@ fn websocket_accept(key: &str) -> String {
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let digest = hasher.finalize();
     BASE64_STD.encode(digest)
+}
+
+async fn load_rustls_config(cert_path: &str, key_path: &str) -> anyhow::Result<RustlsConfig> {
+    let mut cert_chain: Vec<CertificateDer<'static>> = Vec::new();
+    let mut private_key: Option<PrivateKeyDer<'static>> = None;
+
+    let cert_bytes = fs::read(cert_path).await?;
+    let mut reader = cert_bytes.as_slice();
+    while let Some(item) = rustls_pemfile::read_one(&mut reader)? {
+        match item {
+            rustls_pemfile::Item::X509Certificate(cert) => {
+                cert_chain.push(cert);
+            }
+            _ => {}
+        }
+    }
+    if cert_chain.is_empty() {
+        anyhow::bail!("no certificates found in {}", cert_path);
+    }
+
+    let key_bytes = fs::read(key_path).await?;
+    let mut key_reader = key_bytes.as_slice();
+    while let Some(item) = rustls_pemfile::read_one(&mut key_reader)? {
+        match item {
+            rustls_pemfile::Item::Pkcs8Key(k) => {
+                private_key = Some(PrivateKeyDer::from(k));
+                break;
+            }
+            rustls_pemfile::Item::Sec1Key(k) => {
+                private_key = Some(PrivateKeyDer::from(k));
+                break;
+            }
+            rustls_pemfile::Item::Pkcs1Key(k) => {
+                private_key = Some(PrivateKeyDer::from(k));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let key =
+        private_key.ok_or_else(|| anyhow::anyhow!("no usable private key in {}", key_path))?;
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)?;
+    Ok(RustlsConfig::from_config(std::sync::Arc::new(
+        server_config,
+    )))
 }
 
 async fn try_acme_challenge(path: &str) -> Option<Response<Body>> {
@@ -1892,7 +2116,7 @@ async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
     for listener in listeners {
         for upstream in listener.upstreams {
             let ok = match listener.protocol {
-                Protocol::Http => check_http(client, &upstream.address).await,
+                Protocol::Http => check_http(client, &ensure_http_scheme(&upstream.address)).await,
                 Protocol::Tcp => check_tcp(&upstream.address).await,
             };
             state.health.write().insert(upstream.id, ok);

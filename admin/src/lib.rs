@@ -54,6 +54,14 @@ impl Default for DnsProvider {
     }
 }
 
+fn default_provider_url(provider: &DnsProvider) -> String {
+    match provider {
+        DnsProvider::Cloudflare => "https://api.cloudflare.com/client/v4".to_string(),
+        DnsProvider::Route53 => "https://route53.amazonaws.com".to_string(),
+        DnsProvider::Generic => String::new(),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Role {
@@ -114,6 +122,26 @@ struct AcmeProviderConfig {
     zone: Option<String>,
     #[serde(default)]
     txt_prefix: Option<String>,
+    #[serde(default)]
+    api_base: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct CertificateBundle {
+    name: String,
+    cert_path: String,
+    key_path: String,
+    #[serde(default)]
+    source: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CertificatePayload {
+    name: String,
+    cert_pem: String,
+    key_pem: String,
+    #[serde(default)]
+    source: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -206,6 +234,9 @@ fn app() -> Html {
     let acme_providers = use_state(Vec::<AcmeProviderConfig>::new);
     let acme_form = use_state(AcmeProviderForm::default);
     let acme_status = use_state(StatusLine::default);
+    let certs = use_state(Vec::<CertificateBundle>::new);
+    let cert_form = use_state(CertificateForm::default);
+    let cert_status = use_state(StatusLine::default);
 
     let handle_error = {
         let session = session.clone();
@@ -235,12 +266,16 @@ fn app() -> Html {
         let metrics_rows = metrics_rows.clone();
         let acme_providers_state = acme_providers.clone();
         let handle_error_acme = handle_error.clone();
+        let certs_effect = certs.clone();
+        let handle_error_cert = handle_error.clone();
         use_effect_with((*tab).clone(), move |current_tab: &Tab| {
             let metrics_text = metrics_text.clone();
             let metrics_rows = metrics_rows.clone();
             let session = session.clone();
             let acme_providers = acme_providers_state.clone();
             let handle_error_acme = handle_error_acme.clone();
+            let certs_state = certs_effect.clone();
+            let handle_error_cert = handle_error_cert.clone();
             if *current_tab == Tab::Metrics {
                 spawn_local(async move {
                     if session.is_none() {
@@ -262,6 +297,10 @@ fn app() -> Html {
                                 Ok(list) => acme_providers.set(list),
                                 Err(err) => handle_error_acme(err),
                             }
+                            match api_certs().await {
+                                Ok(list) => certs_state.set(list),
+                                Err(err) => handle_error_cert(err),
+                            }
                         }
                     }
                 });
@@ -277,6 +316,7 @@ fn app() -> Html {
         let session = session.clone();
         let users = users.clone();
         let acme_providers = acme_providers.clone();
+        let certs = certs.clone();
         let handle_error = handle_error.clone();
         let status = status.clone();
         use_effect_with((*session).clone(), move |current: &Option<Session>| {
@@ -300,6 +340,9 @@ fn app() -> Html {
                         }
                         if let Ok(p) = api_acme_providers().await {
                             acme_providers.set(p);
+                        }
+                        if let Ok(c) = api_certs().await {
+                            certs.set(c);
                         }
                     }
                     loading.set(false);
@@ -596,6 +639,15 @@ fn app() -> Html {
                                             }}
                                             aria-label="ACME"
                                         >{"ACME"}</button>
+                                        <button
+                                            type="button"
+                                            class={classes!("ghost", if *tab == Tab::Certs { "pill-on" } else { "" })}
+                                            onclick={{
+                                                let tab = tab.clone();
+                                                Callback::from(move |_| tab.set(Tab::Certs))
+                                            }}
+                                            aria-label="Certificates"
+                                        >{"Certificates"}</button>
                                     </>
                                 }
                             } else { html!{} }
@@ -628,13 +680,20 @@ fn app() -> Html {
                     Tab::Metrics => "metrics",
                     Tab::Users => "users",
                     Tab::Acme => "acme",
+                    Tab::Certs => "certs",
                 }
             }>
                 { match *tab {
                     Tab::Listeners => html! {
                         <div key="listeners-pane">
                             <section class="panel">
-                                <h2>{"Create Listener"}</h2>
+                                <div class="panel-head">
+                                    <div>
+                                        <p class="eyebrow">{"Listeners"}</p>
+                                        <h2>{"Create Listener"}</h2>
+                                        <p class="muted">{"Define how traffic enters and which upstreams receive it. Keep it lean; optional settings stay tucked away until needed."}</p>
+                                    </div>
+                                </div>
                                 <form class="form-grid" onsubmit={on_submit}>
                                     <label class="field">
                                         <span>{"Name"}</span>
@@ -682,7 +741,6 @@ fn app() -> Html {
                                                         next.acme_enabled = false;
                                                         next.acme_email.clear();
                                                         next.acme_directory.clear();
-                                                        next.acme_cache.clear();
                                                         next.acme_challenge = AcmeChallenge::Http01;
                                                         next.acme_provider.clear();
                                                         next.sticky = StickyMode::None;
@@ -717,11 +775,10 @@ fn app() -> Html {
                                             <option value="cookie" selected={form.sticky == StickyMode::Cookie}>{"Cookie (per upstream)"}</option>
                                             <option value="ip_hash" selected={form.sticky == StickyMode::IpHash}>{"Client IP hash"}</option>
                                         </select>
-                                        <p class="hint">{"HTTP only. Cookie sets a sticky upstream id."}</p>
                                     </label>
                                     <label class="field span-2">
                                         <span>{"Upstreams (one per line, optional label via name=url)"}</span>
-                                        <p class="hint">{"HTTP: include http(s)://. TCP: host:port."}</p>
+                                        <p class="hint">{"HTTP include scheme; TCP use host:port."}</p>
                                         <textarea
                                             value={form.upstreams_text.clone()}
                                             oninput={{
@@ -740,7 +797,7 @@ fn app() -> Html {
                                             html!{
                                                 <>
                                                     <label class="field">
-                                                        <span>{"TLS termination (PEM paths)"}</span>
+                                                        <span>{"TLS termination"}</span>
                                                         <div class="inline">
                                                             <input
                                                                 type="checkbox"
@@ -752,46 +809,51 @@ fn app() -> Html {
                                                                         next.tls_enabled = checkbox_checked(&e);
                                                                         if next.tls_enabled {
                                                                             next.acme_enabled = false;
+                                                                        } else {
+                                                                            next.cert_path.clear();
+                                                                            next.key_path.clear();
+                                                                            next.selected_cert.clear();
                                                                         }
                                                                         form.set(next);
                                                                     })
                                                                 }}
                                                                 aria-label="Enable TLS"
                                                             />
-                                                            <p class="hint">{"Enable Rustls with cert/key PEM files"}</p>
+                                                            <p class="hint">{"Use an existing certificate. If none selected, ACME is recommended below."}</p>
                                                         </div>
                                                     </label>
                                                     <label class="field">
-                                                        <span>{"Certificate path"}</span>
-                                                        <input
-                                                            value={form.cert_path.clone()}
+                                                        <span>{"Certificate"}</span>
+                                                        <select
                                                             disabled={!form.tls_enabled}
-                                                            oninput={{
+                                                            onchange={{
                                                                 let form = form.clone();
-                                                                Callback::from(move |e: InputEvent| {
+                                                                let certs = certs.clone();
+                                                                Callback::from(move |e: Event| {
                                                                     let mut next = (*form).clone();
-                                                                    next.cert_path = event_value(&e);
+                                                                    let name = select_value(&e).unwrap_or_default();
+                                                                    next.selected_cert = name.clone();
+                                                                    if let Some(bundle) = certs.iter().find(|c| c.name == name) {
+                                                                        next.cert_path = bundle.cert_path.clone();
+                                                                        next.key_path = bundle.key_path.clone();
+                                                                    } else {
+                                                                        next.cert_path.clear();
+                                                                        next.key_path.clear();
+                                                                    }
                                                                     form.set(next);
                                                                 })
                                                             }}
-                                                            placeholder="/etc/ssl/certs/balor.crt"
-                                                        />
-                                                    </label>
-                                                    <label class="field">
-                                                        <span>{"Private key path"}</span>
-                                                        <input
-                                                            value={form.key_path.clone()}
-                                                            disabled={!form.tls_enabled}
-                                                            oninput={{
-                                                                let form = form.clone();
-                                                                Callback::from(move |e: InputEvent| {
-                                                                    let mut next = (*form).clone();
-                                                                    next.key_path = event_value(&e);
-                                                                    form.set(next);
-                                                                })
-                                                            }}
-                                                            placeholder="/etc/ssl/private/balor.key"
-                                                        />
+                                                        >
+                                                            <option value="" selected={form.selected_cert.is_empty()}>{"Select certificate"}</option>
+                                                            { for certs.iter().map(|c| {
+                                                                html!{ <option value={c.name.clone()} selected={form.selected_cert == c.name}>{format!("{} ({})", c.name, c.source)}</option> }
+                                                            }) }
+                                                        </select>
+                                                        {
+                                                            if form.selected_cert.is_empty() {
+                                                                html!{<p class="hint">{"No certificate selected. Use the Certificates tab to upload, or enable ACME below."}</p>}
+                                                            } else { html!{} }
+                                                        }
                                                     </label>
                                                     {
                                                         if form.sticky == StickyMode::Cookie {
@@ -938,22 +1000,6 @@ fn app() -> Html {
                                                                 })
                                                             }}
                                                             placeholder="https://acme-v02.api.letsencrypt.org/directory"
-                                                        />
-                                                    </label>
-                                                    <label class="field">
-                                                        <span>{"Cache dir (optional override)"}</span>
-                                                        <input
-                                                            value={form.acme_cache.clone()}
-                                                            disabled={!form.acme_enabled}
-                                                            oninput={{
-                                                                let form = form.clone();
-                                                                Callback::from(move |e: InputEvent| {
-                                                                    let mut next = (*form).clone();
-                                                                    next.acme_cache = event_value(&e);
-                                                                    form.set(next);
-                                                                })
-                                                            }}
-                                                            placeholder="data/acme-challenges"
                                                         />
                                                     </label>
                                                 </>
@@ -1145,6 +1191,7 @@ fn app() -> Html {
                                                 "generic" => DnsProvider::Generic,
                                                 _ => DnsProvider::Cloudflare,
                                             };
+                                            next.provider_url = default_provider_url(&next.provider);
                                             acme_form.set(next);
                                         })
                                     }}>
@@ -1152,6 +1199,21 @@ fn app() -> Html {
                                         <option value="route53" selected={acme_form.provider == DnsProvider::Route53}>{"AWS Route53"}</option>
                                         <option value="generic" selected={acme_form.provider == DnsProvider::Generic}>{"Generic (token-based)"}</option>
                                     </select>
+                                </label>
+                                <label class="field">
+                                    <span>{"API base URL"}</span>
+                                    <input
+                                        value={acme_form.provider_url.clone()}
+                                        oninput={{
+                                            let acme_form = acme_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*acme_form).clone();
+                                                next.provider_url = event_value(&e);
+                                                acme_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="https://api.cloudflare.com/client/v4"
+                                    />
                                 </label>
                                 <label class="field">
                                     <span>{"API token (use for Cloudflare / generic)"}</span>
@@ -1283,6 +1345,173 @@ fn app() -> Html {
                                     }
                                 }) }
                                 { if acme_providers.is_empty() { html!{<p class="muted">{"No ACME DNS providers configured."}</p>} } else { html!{} } }
+                            </div>
+                        </section>
+                    },
+                    Tab::Certs => html! {
+                        <section class="panel" key="certs-pane">
+                            <div class="panel-head">
+                                <div>
+                                    <p class="eyebrow">{"Certificates"}</p>
+                                    <h2>{"Upload or download PEM bundles"}</h2>
+                                    <p class="muted">{"Use manual uploads for custom certs. ACME-issued certs will appear here when automation is wired."}</p>
+                                </div>
+                                <StatusBadge status={(*cert_status).clone()} />
+                            </div>
+                            <form class="form-grid" onsubmit={{
+                                let cert_form = cert_form.clone();
+                                let certs = certs.clone();
+                                let cert_status = cert_status.clone();
+                                let handle_error = handle_error.clone();
+                                Callback::from(move |e: SubmitEvent| {
+                                    e.prevent_default();
+                                    let payload = match (*cert_form).clone().into_payload() {
+                                        Ok(p) => p,
+                                        Err(msg) => {
+                                            cert_status.set(StatusLine::error(msg));
+                                            return;
+                                        }
+                                    };
+                                    let certs = certs.clone();
+                                    let cert_status = cert_status.clone();
+                                    let cert_form = cert_form.clone();
+                                    let handle_error = handle_error.clone();
+                                    spawn_local(async move {
+                                        match api_upload_cert(payload).await {
+                                            Ok(saved) => {
+                                                let mut list = (*certs).clone();
+                                                if let Some(pos) = list.iter().position(|c| c.name == saved.name) {
+                                                    list[pos] = saved.clone();
+                                                } else {
+                                                    list.push(saved.clone());
+                                                }
+                                                certs.set(list);
+                                                cert_form.set(CertificateForm::default());
+                                                cert_status.set(StatusLine::success("Certificate uploaded"));
+                                            }
+                                            Err(err) => handle_error(err),
+                                        }
+                                    });
+                                })
+                            }}>
+                                <label class="field">
+                                    <span>{"Name"}</span>
+                                    <input
+                                        value={cert_form.name.clone()}
+                                        oninput={{
+                                            let cert_form = cert_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*cert_form).clone();
+                                                next.name = event_value(&e);
+                                                cert_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="edge-cert"
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>{"Certificate (PEM)"}</span>
+                                    <textarea
+                                        value={cert_form.cert_pem.clone()}
+                                        oninput={{
+                                            let cert_form = cert_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*cert_form).clone();
+                                                next.cert_pem = textarea_value(&e);
+                                                cert_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="-----BEGIN CERTIFICATE-----"
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>{"Private key (PEM)"}</span>
+                                    <textarea
+                                        value={cert_form.key_pem.clone()}
+                                        oninput={{
+                                            let cert_form = cert_form.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let mut next = (*cert_form).clone();
+                                                next.key_pem = textarea_value(&e);
+                                                cert_form.set(next);
+                                            })
+                                        }}
+                                        placeholder="-----BEGIN PRIVATE KEY-----"
+                                    />
+                                </label>
+                                <div class="actions">
+                                    <button class="primary" type="submit">{"Upload"}</button>
+                                    <button class="ghost" type="button" onclick={{
+                                        let cert_form = cert_form.clone();
+                                        let cert_status = cert_status.clone();
+                                        Callback::from(move |_| {
+                                            cert_form.set(CertificateForm::default());
+                                            cert_status.set(StatusLine::clear());
+                                        })
+                                    }}>{"Clear"}</button>
+                                </div>
+                            </form>
+                            <div class="cards">
+                                { for certs.iter().map(|c| {
+                                    let cert_status = cert_status.clone();
+                                    let certs = certs.clone();
+                                    let handle_error = handle_error.clone();
+                                    let name = c.name.clone();
+                                    html!{
+                                        <article class="card">
+                                            <div class="card-head">
+                                                <div>
+                                                    <p class="eyebrow">{&c.source}</p>
+                                                    <h3>{ &c.name }</h3>
+                                                    <p class="muted mono">{&c.cert_path}</p>
+                                                </div>
+                                                <div class="pill-row">
+                                                    <button class="ghost" type="button" onclick={{
+                                                        let name = name.clone();
+                                                        let cert_status = cert_status.clone();
+                                                        let handle_error = handle_error.clone();
+                                                        Callback::from(move |_| {
+                                                            let name = name.clone();
+                                                            let cert_status = cert_status.clone();
+                                                            let handle_error = handle_error.clone();
+                                                            spawn_local(async move {
+                                                                match api_get_cert(&name).await {
+                                                                    Ok(bundle) => {
+                                                                        cert_status.set(StatusLine::success(format!("Downloaded {}", bundle.name)));
+                                                                    }
+                                                                    Err(err) => handle_error(err),
+                                                                }
+                                                            });
+                                                        })
+                                                    }}>{"Download"}</button>
+                                                    <button class="ghost" type="button" onclick={{
+                                                        let certs = certs.clone();
+                                                        let cert_status = cert_status.clone();
+                                                        let handle_error = handle_error.clone();
+                                                        let name = name.clone();
+                                                        Callback::from(move |_| {
+                                                            let name = name.clone();
+                                                            let certs = certs.clone();
+                                                            let cert_status = cert_status.clone();
+                                                            let handle_error = handle_error.clone();
+                                                            spawn_local(async move {
+                                                                match api_delete_cert(&name).await {
+                                                                    Ok(_) => {
+                                                                        let filtered: Vec<_> = certs.iter().cloned().filter(|x| x.name != name).collect();
+                                                                        certs.set(filtered);
+                                                                        cert_status.set(StatusLine::success("Deleted certificate"));
+                                                                    }
+                                                                    Err(err) => handle_error(err),
+                                                                }
+                                                            });
+                                                        })
+                                                    }}>{"Delete"}</button>
+                                                </div>
+                                            </div>
+                                        </article>
+                                    }
+                                }) }
+                                { if certs.is_empty() { html!{<p class="muted">{"No certificates uploaded."}</p>} } else { html!{} } }
                             </div>
                         </section>
                     },
@@ -1467,7 +1696,15 @@ fn render_listener(
                 }
                 {
                     if listener.tls.is_some() {
-                        html! { <span class="pill pill-glow">{"TLS"}</span> }
+                        let label = listener
+                            .tls
+                            .as_ref()
+                            .and_then(|t| {
+                                let parts: Vec<&str> = t.cert_path.rsplit('/').collect();
+                                parts.get(0).cloned().map(|s| format!("TLS: {}", s))
+                            })
+                            .unwrap_or_else(|| "TLS".to_string());
+                        html! { <span class="pill pill-glow">{label}</span> }
                     } else {
                         html! {}
                     }
@@ -1514,10 +1751,10 @@ struct ListenerForm {
     tls_enabled: bool,
     cert_path: String,
     key_path: String,
+    selected_cert: String,
     acme_enabled: bool,
     acme_email: String,
     acme_directory: String,
-    acme_cache: String,
     acme_challenge: AcmeChallenge,
     acme_provider: String,
     sticky: StickyMode,
@@ -1530,6 +1767,7 @@ enum Tab {
     Users,
     Metrics,
     Acme,
+    Certs,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1549,11 +1787,20 @@ struct UserForm {
 struct AcmeProviderForm {
     name: String,
     provider: DnsProvider,
+    provider_url: String,
     api_token: String,
     access_key: String,
     secret_key: String,
     zone: String,
     txt_prefix: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CertificateForm {
+    name: String,
+    cert_pem: String,
+    key_pem: String,
+    source: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1573,10 +1820,10 @@ impl Default for ListenerForm {
             tls_enabled: false,
             cert_path: String::new(),
             key_path: String::new(),
+            selected_cert: String::new(),
             acme_enabled: false,
             acme_email: String::new(),
             acme_directory: String::new(),
-            acme_cache: String::new(),
             acme_challenge: AcmeChallenge::Http01,
             acme_provider: String::new(),
             sticky: StickyMode::None,
@@ -1590,6 +1837,7 @@ impl Default for AcmeProviderForm {
         Self {
             name: String::new(),
             provider: DnsProvider::Cloudflare,
+            provider_url: default_provider_url(&DnsProvider::Cloudflare),
             api_token: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
@@ -1599,11 +1847,26 @@ impl Default for AcmeProviderForm {
     }
 }
 
+impl Default for CertificateForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            source: "manual".into(),
+        }
+    }
+}
+
 impl AcmeProviderForm {
     fn from_config(cfg: &AcmeProviderConfig) -> Self {
         Self {
             name: cfg.name.clone(),
             provider: cfg.provider.clone(),
+            provider_url: cfg
+                .api_base
+                .clone()
+                .unwrap_or_else(|| default_provider_url(&cfg.provider)),
             api_token: cfg.api_token.clone().unwrap_or_default(),
             access_key: cfg.access_key.clone().unwrap_or_default(),
             secret_key: cfg.secret_key.clone().unwrap_or_default(),
@@ -1619,12 +1882,30 @@ impl AcmeProviderForm {
         AcmeProviderConfig {
             name: self.name,
             provider: self.provider,
+            api_base: (!self.provider_url.trim().is_empty()).then(|| self.provider_url),
             api_token: (!self.api_token.trim().is_empty()).then(|| self.api_token),
             access_key: (!self.access_key.trim().is_empty()).then(|| self.access_key),
             secret_key: (!self.secret_key.trim().is_empty()).then(|| self.secret_key),
             zone: (!self.zone.trim().is_empty()).then(|| self.zone),
             txt_prefix: (!self.txt_prefix.trim().is_empty()).then(|| self.txt_prefix),
         }
+    }
+}
+
+impl CertificateForm {
+    fn into_payload(self) -> Result<CertificatePayload, String> {
+        if self.name.trim().is_empty() {
+            return Err("Certificate name is required".into());
+        }
+        if self.cert_pem.trim().is_empty() || self.key_pem.trim().is_empty() {
+            return Err("Provide certificate and key PEM".into());
+        }
+        Ok(CertificatePayload {
+            name: self.name,
+            cert_pem: self.cert_pem,
+            key_pem: self.key_pem,
+            source: self.source,
+        })
     }
 }
 
@@ -1661,6 +1942,11 @@ impl ListenerForm {
         } else {
             (false, String::new(), String::new())
         };
+        let selected_cert = listener
+            .tls
+            .as_ref()
+            .and_then(|t| t.cert_path.rsplit('/').next().map(|s| s.to_string()))
+            .unwrap_or_default();
 
         let (sticky, cookie_name) = if let Some(sticky) = &listener.sticky {
             let name = sticky
@@ -1675,20 +1961,18 @@ impl ListenerForm {
             (StickyMode::None, "BALOR_STICKY".to_string())
         };
 
-        let (acme_enabled, acme_email, acme_directory, acme_cache, acme_challenge, acme_provider) =
+        let (acme_enabled, acme_email, acme_directory, acme_challenge, acme_provider) =
             if let Some(acme) = &listener.acme {
                 (
                     true,
                     acme.email.clone().unwrap_or_default(),
                     acme.directory_url.clone().unwrap_or_default(),
-                    acme.cache_dir.clone().unwrap_or_default(),
                     acme.challenge.clone(),
                     acme.provider.clone().unwrap_or_default(),
                 )
             } else {
                 (
                     false,
-                    String::new(),
                     String::new(),
                     String::new(),
                     AcmeChallenge::Http01,
@@ -1704,10 +1988,10 @@ impl ListenerForm {
             tls_enabled,
             cert_path,
             key_path,
+            selected_cert,
             acme_enabled,
             acme_email,
             acme_directory,
-            acme_cache,
             acme_challenge,
             acme_provider,
             sticky,
@@ -1737,10 +2021,10 @@ impl ListenerForm {
 
         let tls = if self.tls_enabled && self.protocol == Protocol::Http {
             if self.acme_enabled {
-                return Err("Choose either ACME automation or TLS PEM paths, not both".into());
+                return Err("Choose either ACME automation or a certificate, not both".into());
             }
             if self.cert_path.trim().is_empty() || self.key_path.trim().is_empty() {
-                return Err("Provide TLS cert and key paths".into());
+                return Err("Select a certificate for TLS".into());
             }
             Some(TlsConfig {
                 cert_path: self.cert_path.clone(),
@@ -1758,7 +2042,7 @@ impl ListenerForm {
                 email: (!self.acme_email.trim().is_empty()).then(|| self.acme_email.clone()),
                 directory_url: (!self.acme_directory.trim().is_empty())
                     .then(|| self.acme_directory.clone()),
-                cache_dir: (!self.acme_cache.trim().is_empty()).then(|| self.acme_cache.clone()),
+                cache_dir: None,
                 challenge: self.acme_challenge.clone(),
                 provider: (!self.acme_provider.trim().is_empty())
                     .then(|| self.acme_provider.clone()),
@@ -2108,6 +2392,46 @@ async fn api_upsert_acme_provider(
 
 async fn api_delete_acme_provider(name: String) -> Result<(), String> {
     let url = format!("/api/acme/providers/{name}");
+    let resp = with_auth(Request::delete(&url))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(format!("delete failed: {}", resp.status()))
+    }
+}
+
+async fn api_certs() -> Result<Vec<CertificateBundle>, String> {
+    let resp = with_auth(Request::get("/api/certs"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<Vec<CertificateBundle>>(resp).await
+}
+
+async fn api_upload_cert(payload: CertificatePayload) -> Result<CertificateBundle, String> {
+    let resp = with_auth(Request::post("/api/certs"))
+        .json(&payload)
+        .map_err(|e| format!("serialize: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<CertificateBundle>(resp).await
+}
+
+async fn api_get_cert(name: &str) -> Result<CertificatePayload, String> {
+    let url = format!("/api/certs/{name}");
+    let resp = with_auth(Request::get(&url))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<CertificatePayload>(resp).await
+}
+
+async fn api_delete_cert(name: &str) -> Result<(), String> {
+    let url = format!("/api/certs/{name}");
     let resp = with_auth(Request::delete(&url))
         .send()
         .await
