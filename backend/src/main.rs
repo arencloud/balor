@@ -29,7 +29,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use rand_core::OsRng;
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
 use serde::{Deserialize, Serialize};
@@ -2086,29 +2086,21 @@ async fn load_certified_key(cert_path: &str, key_path: &str) -> anyhow::Result<C
 }
 
 async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<RustlsConfig> {
-    let mut resolver = ResolvesServerCertUsingSni::new();
+    let mut hosts: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
+    let mut default_key: Option<Arc<CertifiedKey>> = None;
 
-    let mut default_key: Option<CertifiedKey> = None;
     if let Some(tls) = &listener.tls {
-        let key = load_certified_key(&tls.cert_path, &tls.key_path).await?;
+        let key = Arc::new(load_certified_key(&tls.cert_path, &tls.key_path).await?);
         default_key = Some(key.clone());
-        let _ = resolver.add("default", key);
+        hosts.insert("default".into(), key);
     }
 
     if let Some(routes) = &listener.host_routes {
         for route in routes {
             if let Some(tls) = &route.tls {
-                let key = load_certified_key(&tls.cert_path, &tls.key_path).await?;
+                let key = Arc::new(load_certified_key(&tls.cert_path, &tls.key_path).await?);
                 let hostname = route.host.split(':').next().unwrap_or("").to_lowercase();
-                match resolver.add(&hostname, key.clone()) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        warn!(
-                            "SNI add failed for host {}: {} (will fall back to default cert)",
-                            hostname, err
-                        );
-                    }
-                }
+                hosts.insert(hostname, key.clone());
                 if default_key.is_none() {
                     default_key = Some(key);
                 }
@@ -2119,10 +2111,8 @@ async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<Ru
     let Some(default_key) = default_key else {
         anyhow::bail!("no TLS certificates configured");
     };
-    let sni_resolver = Arc::new(SniResolver {
-        resolver: Arc::new(resolver),
-        default_key: Arc::new(default_key),
-    });
+
+    let sni_resolver = Arc::new(ManualSniResolver { hosts, default_key });
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -2130,20 +2120,22 @@ async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<Ru
     Ok(RustlsConfig::from_config(Arc::new(server_config)))
 }
 
-#[derive(Debug, Clone)]
-struct SniResolver {
-    resolver: Arc<ResolvesServerCertUsingSni>,
+#[derive(Debug)]
+struct ManualSniResolver {
+    hosts: HashMap<String, Arc<CertifiedKey>>,
     default_key: Arc<CertifiedKey>,
 }
 
-impl ResolvesServerCert for SniResolver {
+impl ResolvesServerCert for ManualSniResolver {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        if client_hello.server_name().is_some() {
-            if let Some(key) = self.resolver.resolve(client_hello) {
-                return Some(key);
+        if let Some(name) = client_hello.server_name() {
+            let name = name.to_lowercase();
+            if let Some(key) = self.hosts.get(&name) {
+                return Some(key.clone());
             }
         }
-        Some(self.default_key.clone())
+        // Fallback to default cert.
+        self.default_key.clone().into()
     }
 }
 
