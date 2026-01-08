@@ -1443,7 +1443,8 @@ impl HttpProxyState {
             .headers()
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
-            .map(|h| h.to_lowercase());
+            .map(|h| h.to_lowercase())
+            .map(|h| h.split(':').next().unwrap_or("").to_string());
         let enabled: Vec<_> = if let Some(h) = host {
             if let Some(rule) = self.host_routes.iter().find(|r| r.host == h) {
                 rule.upstreams
