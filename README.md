@@ -42,7 +42,7 @@ flowchart LR
 
 - **Backend (`backend`)**: Axum HTTP server exposing CRUD APIs for listeners and serving the compiled admin UI. A supervisor spawns runtime tasks per listener:
   - **HTTP (L7)**: Axum fallback proxy with round-robin upstream selection and header sanitization. Host-based routing is first-class: each host binds to an upstream pool and can carry its own TLS/ACME settings (SNI).
-  - **TCP (L4)**: Tokio `copy_bidirectional` bridge with round-robin upstream selection.
+  - **TCP (L4)**: Tokio `copy_bidirectional` bridge with round-robin upstream selection. TCP listeners now reuse upstream pools (pick a pool; the UI hydrates endpoints automatically).
 - **Admin UI (`admin`)**: Yew single-page app compiled to WASM via Trunk. Provides listener creation, editing, deletion, and live stats against `/api/*`. Uses the logo at `images/balor.png`.
 - **Workspace**: Cargo workspace rooted at repository top; shared dependencies declared in the workspace `[dependencies]`.
 
@@ -70,7 +70,7 @@ Environment knobs:
 - `GET /api/health` – service heartbeat.
 - `GET /api/stats` – listener/task counts.
 - `GET /api/listeners` – list configured listeners.
-- `POST /api/listeners` – create listener. HTTP listeners now rely on host-based routes: `{ name, listen, protocol: "http"|"tcp", host_routes: [{ host, pool, tls?, acme? }], upstreams: [...] }` (TCP uses `upstreams`). Pools are referenced by name.
+- `POST /api/listeners` – create listener. HTTP listeners rely on host-based routes: `{ name, listen, protocol: "http", host_routes: [{ host, pool, tls?, acme? }], upstreams: [...] }` (TCP uses `upstreams`, typically hydrated from a selected pool in the UI). Pools are referenced by name.
 - `GET /api/listeners/{id}` – fetch a listener.
 - `PUT /api/listeners/{id}` – update a listener.
 - `DELETE /api/listeners/{id}` – remove a listener and stop its runtime.
@@ -79,10 +79,10 @@ Environment knobs:
 - `GET/POST/PUT/DELETE /api/users` – RBAC user management (admin only).
 
 ## Notes
-- HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port. HTTP host routes pick from pools (no inline upstreams in the UI).
+- HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port. HTTP host routes pick from pools (pool selection is required per host); TCP listeners select a pool and the UI fills endpoints for you.
 - State persists to `data/balor_state.json` on each change (path override via `BALOR_STATE_FILE`).
 - Background health checks run every ~5 seconds and mark upstreams up/down in the UI automatically.
-- HTTP listeners can terminate TLS via PEM cert/key paths; files are reloaded when they change.
+- HTTP listeners can terminate TLS via PEM cert/key paths; files are reloaded when they change. Multiple certificates on one port are supported via per-host SNI selection; a listener-level certificate acts as fallback.
 - Sticky sessions supported per HTTP listener (cookie or client IP hash).
 - Upstream `Set-Cookie` domains are rewritten to the client-facing host to keep sessions alive across refreshes when proxied.
 - RBAC roles: Admin (full), Operator (CRUD listeners), Viewer (read-only).

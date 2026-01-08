@@ -560,9 +560,21 @@ fn app() -> Html {
         let loading = loading.clone();
         let editing = editing.clone();
         let handle_error = handle_error.clone();
+        let pools = pools.clone();
         Callback::from(move |event: SubmitEvent| {
             event.prevent_default();
-            let payload = match form.to_payload() {
+            let mut working = (*form).clone();
+            if working.protocol == Protocol::Tcp && !working.tcp_pool.trim().is_empty() {
+                if let Some(pool) = pools.iter().find(|p| p.name == working.tcp_pool) {
+                    working.upstreams_text = pool
+                        .upstreams
+                        .iter()
+                        .map(|u| format!("{}={}", u.name, u.address))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
+            }
+            let payload = match working.to_payload() {
                 Ok(payload) => payload,
                 Err(msg) => {
                     status.set(StatusLine::error(msg));
@@ -839,6 +851,7 @@ fn app() -> Html {
                                                         next.acme_challenge = AcmeChallenge::Http01;
                                                         next.acme_provider.clear();
                                                         next.sticky = StickyMode::None;
+                                                        next.tcp_pool.clear();
                                                     } else {
                                                         // HTTP path relies on host-based routing by default.
                                                         next.upstreams_text.clear();
@@ -877,6 +890,45 @@ fn app() -> Html {
                                             <option value="ip_hash" selected={form.sticky == StickyMode::IpHash}>{"Client IP hash"}</option>
                                         </select>
                                     </label>
+                                    {
+                                        if form.protocol == Protocol::Tcp {
+                                            html!{
+                                                <div class="panel compact span-12">
+                                                    <div class="panel-head">
+                                                        <span>{"Upstream pool (TCP)"}</span>
+                                                        <p class="hint">{"Pick a pool; its endpoints will be used automatically."}</p>
+                                                    </div>
+                                                    <label class="field">
+                                                        <span>{"Pool (required)"}</span>
+                                                        <select
+                                                            onchange={{
+                                                                let form = form.clone();
+                                                                let pools = pools.clone();
+                                                                Callback::from(move |e: Event| {
+                                                                    let mut next = (*form).clone();
+                                                                    let val = select_value(&e).unwrap_or_default();
+                                                                    next.tcp_pool = val.clone();
+                                                                    if !val.is_empty() {
+                                                                        if let Some(pool) = pools.iter().find(|p| p.name == val) {
+                                                                            next.upstreams_text = pool.upstreams.iter().map(|u| format!("{}={}", u.name, u.address)).collect::<Vec<_>>().join("\n");
+                                                                        }
+                                                                    } else {
+                                                                        next.upstreams_text.clear();
+                                                                    }
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                        >
+                                                            <option value="" selected={form.tcp_pool.is_empty()}>{"Select pool"}</option>
+                                                            { for pools.iter().map(|p| {
+                                                                html!{ <option value={p.name.clone()} selected={form.tcp_pool == p.name}>{&p.name}</option> }
+                                                            }) }
+                                                        </select>
+                                                    </label>
+                                                </div>
+                                            }
+                                        } else { html!{} }
+                                    }
                                     {
                 if form.protocol == Protocol::Http {
                     html!{
@@ -2024,6 +2076,7 @@ struct ListenerForm {
     listen: String,
     protocol: Protocol,
     upstreams_text: String,
+    tcp_pool: String,
     host_rules: Vec<HostRuleForm>,
     tls_enabled: bool,
     cert_path: String,
@@ -2096,6 +2149,7 @@ impl Default for ListenerForm {
             listen: String::from("0.0.0.0:9000"),
             protocol: Protocol::Http,
             upstreams_text: String::from("http://127.0.0.1:7000"),
+            tcp_pool: String::new(),
             host_rules: vec![HostRuleForm::default()],
             tls_enabled: false,
             cert_path: String::new(),
@@ -2345,6 +2399,7 @@ impl ListenerForm {
             listen: listener.listen.clone(),
             protocol: listener.protocol.clone(),
             upstreams_text,
+            tcp_pool: String::new(),
             host_rules,
             tls_enabled,
             cert_path,
