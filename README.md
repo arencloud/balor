@@ -88,7 +88,7 @@ Environment knobs:
 - RBAC roles: Admin (full), Operator (CRUD listeners), Viewer (read-only).
 - Prometheus metrics exposed at `/metrics` (HTTP counters/latency and TCP connection totals per listener).
 - WebSocket pass-through supported for HTTP listeners (upgrade + bidirectional frames).
-- ACME automation: HTTP-01 responder serves tokens from `BALOR_ACME_CHALLENGE_DIR` (default `data/acme-challenges`); DNS-01 flow supported with provider profiles (Cloudflare, Route53, generic) configurable in the Admin UI ACME tab (full issuance/renewal wiring is in progress). Per-host ACME is available on host routes.
+- ACME automation: HTTP-01 responder serves tokens from `BALOR_ACME_CHALLENGE_DIR` (default `data/acme-challenges`); HTTP-01 issuance now runs automatically for host routes that request ACME and stores PEMs under `data/certs`. DNS-01 flow uses provider profiles (Cloudflare, Route53, generic) in the Admin UI, but automation is still pending.
 - Certificates dashboard: upload/download manual PEM bundles (stored under `BALOR_CERT_DIR`, default `data/certs`) from the Admin UI Certificates tab.
 - ACME provider type auto-sets API base URLs (Cloudflare/Route53) with overrides allowed.
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.

@@ -2,6 +2,7 @@
 // Author: Eduard Gevorkyan (egevorky@arencloud.com)
 // License: Apache 2.0
 
+use acme_lib::{create_p384_key, persist::FilePersist, Directory, DirectoryUrl};
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -44,6 +45,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    thread,
     time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
@@ -1051,7 +1053,16 @@ async fn create_listener(
         store.listeners.insert(id, config.clone());
     }
     persist_store(&state).map_err(|_| ApiError::Internal)?;
+    trigger_acme_automation(state.clone(), id);
     Ok(Json(config))
+}
+
+fn trigger_acme_automation(state: AppState, listener_id: Uuid) {
+    tokio::spawn(async move {
+        if let Err(err) = ensure_acme_for_listener(state.clone(), listener_id).await {
+            warn!("ACME automation for listener {listener_id} failed: {err:?}");
+        }
+    });
 }
 
 #[axum::debug_handler]
@@ -1086,6 +1097,7 @@ async fn update_listener(
         .await
         .map_err(|_| ApiError::Internal)?;
     persist_store(&state).map_err(|_| ApiError::Internal)?;
+    trigger_acme_automation(state.clone(), id);
 
     Ok(Json(config))
 }
@@ -1348,8 +1360,148 @@ fn validate_acme_config(acme: &Option<AcmeConfig>, store: &ConfigStore) -> Resul
                 ));
             }
         }
+        if acme.email.as_deref().unwrap_or("").trim().is_empty() {
+            return Err("ACME requires a contact email".into());
+        }
     }
     Ok(())
+}
+
+async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow::Result<()> {
+    let mut updated: Option<ListenerConfig> = {
+        let store = state.store.read();
+        store.listeners.get(&listener_id).cloned()
+    };
+    let Some(mut config) = updated.take() else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+
+    if let Some(routes) = config.host_routes.as_mut() {
+        for route in routes.iter_mut() {
+            if let Some(acme) = &route.acme {
+                let needs_cert = route
+                    .tls
+                    .as_ref()
+                    .map(|t| !FsPath::new(&t.cert_path).exists())
+                    .unwrap_or(true);
+                if needs_cert {
+                    match obtain_http01_cert(route.host.clone(), acme.clone()).await {
+                        Ok(tls) => {
+                            route.tls = Some(tls);
+                            changed = true;
+                        }
+                        Err(err) => {
+                            warn!("ACME issuance for host {} failed: {err:?}", route.host);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if changed {
+        {
+            let mut store = state.store.write();
+            store.listeners.insert(listener_id, config.clone());
+        }
+        persist_store(&state)?;
+        state.supervisor.upsert(config).await?;
+    }
+
+    Ok(())
+}
+
+async fn obtain_http01_cert(host: String, acme: AcmeConfig) -> anyhow::Result<TlsConfig> {
+    let host = host.split(':').next().unwrap_or("").to_string();
+    let cert_dir = std::env::var("BALOR_CERT_DIR").unwrap_or_else(|_| "data/certs".into());
+    let cache_dir = acme
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| "data/acme-cache".into());
+    let challenge_dir =
+        std::env::var("BALOR_ACME_CHALLENGE_DIR").unwrap_or_else(|_| "data/acme-challenges".into());
+    let email = acme
+        .email
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ACME email required"))?;
+
+    let tls = tokio::task::spawn_blocking(move || -> anyhow::Result<TlsConfig> {
+        std::fs::create_dir_all(&cache_dir)?;
+        std::fs::create_dir_all(&challenge_dir)?;
+
+        let url = match acme.directory_url.as_deref() {
+            Some(url) if url.contains("staging") => DirectoryUrl::LetsEncryptStaging,
+            Some(url) if url.contains("letsencrypt") => DirectoryUrl::LetsEncrypt,
+            Some(url) => DirectoryUrl::Other(url),
+            None => DirectoryUrl::LetsEncrypt,
+        };
+        let persist = FilePersist::new(&cache_dir);
+        let dir = Directory::from_url(persist, url)?;
+        let acc = dir.account(&email)?;
+        let mut ord_new = acc.new_order(&host, &[])?;
+
+        let ord_csr = loop {
+            if let Some(ord_csr) = ord_new.confirm_validations() {
+                break ord_csr;
+            }
+
+            let mut auths = ord_new.authorizations()?;
+            for auth in auths.iter_mut() {
+                match acme.challenge {
+                    AcmeChallenge::Http01 => {
+                        let chall = auth.http_challenge();
+                        let token = chall.http_token();
+                        let proof = chall.http_proof();
+                        let path = FsPath::new(&challenge_dir).join(token);
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&path, proof)?;
+                        chall.validate(5000)?;
+                    }
+                    AcmeChallenge::Dns01 => {
+                        warn!(
+                            "DNS-01 selected for host {}, but DNS automation is not yet implemented",
+                            host
+                        );
+                        return Err(anyhow::anyhow!(
+                            "DNS-01 automation not yet implemented for {}",
+                            host
+                        ));
+                    }
+                }
+            }
+
+            ord_new.refresh()?;
+            thread::sleep(Duration::from_secs(2));
+        };
+
+        let pkey_pri = create_p384_key();
+        let ord_csr = ord_csr.finalize_pkey(pkey_pri, 5000)?;
+        let cert = ord_csr.download_and_save_cert()?;
+
+        let cert_path = FsPath::new(&cert_dir)
+            .join(format!("{}.crt", host.replace('*', "_wildcard")))
+            .to_string_lossy()
+            .to_string();
+        let key_path = FsPath::new(&cert_dir)
+            .join(format!("{}.key", host.replace('*', "_wildcard")))
+            .to_string_lossy()
+            .to_string();
+        std::fs::create_dir_all(&cert_dir)?;
+        std::fs::write(&cert_path, cert.certificate())?;
+        std::fs::write(&key_path, cert.private_key())?;
+
+        Ok(TlsConfig {
+            cert_path,
+            key_path,
+        })
+    })
+    .await??;
+
+    Ok(tls)
 }
 
 impl BalancerSupervisor {

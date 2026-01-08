@@ -36,3 +36,4 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 base64 = "0.22"
 sha1 = "0.10"
 rustls-pemfile = "2"
+acme-lib = "0.9.1"
