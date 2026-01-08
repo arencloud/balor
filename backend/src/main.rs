@@ -1527,6 +1527,13 @@ async fn run_http_listener(
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config.listen.parse()?;
+    let tls_fallback = config.tls.clone().or_else(|| {
+        config
+            .host_routes
+            .as_ref()
+            .and_then(|routes| routes.iter().find_map(|r| r.tls.clone()))
+    });
+
     let state = HttpProxyState::new(
         config.id,
         config.upstreams.clone(),
@@ -1560,10 +1567,10 @@ async fn run_http_listener(
         config.upstreams.len()
     );
 
-    if let Some(tls) = config.tls.clone() {
+    if let Some(tls) = tls_fallback {
         let tls_config = load_rustls_config(&tls.cert_path, &tls.key_path).await?;
         info!(
-            "TLS enabled for '{}' using cert={} key={}",
+            "TLS enabled for '{}' using cert={} key={} (listener or host-route)",
             config.name, tls.cert_path, tls.key_path
         );
         let handle = Handle::new();
