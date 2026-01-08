@@ -1957,35 +1957,54 @@ fn render_listener(
                     }
                 }
             </div>
-            <div class="pill-row">
-                { for listener.upstreams.iter().map(|u| {
-                    let (status, class) = match u.healthy {
-                        Some(true) => ("up", "pill pill-on"),
-                        Some(false) => ("down", "pill pill-error"),
-                        None => ("unknown", "pill pill-ghost"),
-                    };
-                    html!{
-                        <span class={classes!(class)}>
-                            {format!("{} • {} • {}", u.name, u.address, status)}
-                        </span>
-                    }
-                })}
-            </div>
             {
                 if let Some(routes) = &listener.host_routes {
                     html!{
-                        <div class="pill-row">
+                        <div class="pill-column">
                             { for routes.iter().map(|r| {
-                                let label = if let Some(pool) = &r.pool {
-                                    format!("Host {} (pool: {})", r.host, pool)
+                                let host_label = if let Some(pool) = &r.pool {
+                                    format!("{} (pool: {})", r.host, pool)
                                 } else {
-                                    format!("Host {} ({} upstreams)", r.host, r.upstreams.len())
+                                    format!("{}", r.host)
                                 };
-                                html!{ <span class="pill pill-ghost">{label}</span> }
+                                html!{
+                                    <div class="pill-row wrap">
+                                        <span class="pill pill-ghost">{host_label}</span>
+                                        { for r.upstreams.iter().map(|u| {
+                                            let (status, class) = match u.healthy {
+                                                Some(true) => ("up", "pill pill-on"),
+                                                Some(false) => ("down", "pill pill-error"),
+                                                None => ("unknown", "pill pill-ghost"),
+                                            };
+                                            html!{
+                                                <span class={classes!(class)}>
+                                                    {format!("{} • {} • {}", u.name, u.address, status)}
+                                                </span>
+                                            }
+                                        })}
+                                    </div>
+                                }
                             }) }
                         </div>
                     }
-                } else { html!{} }
+                } else {
+                    html!{
+                        <div class="pill-row">
+                            { for listener.upstreams.iter().map(|u| {
+                                let (status, class) = match u.healthy {
+                                    Some(true) => ("up", "pill pill-on"),
+                                    Some(false) => ("down", "pill pill-error"),
+                                    None => ("unknown", "pill pill-ghost"),
+                                };
+                                html!{
+                                    <span class={classes!(class)}>
+                                        {format!("{} • {} • {}", u.name, u.address, status)}
+                                    </span>
+                                }
+                            })}
+                        </div>
+                    }
+                }
             }
         </article>
     }
@@ -2356,19 +2375,10 @@ impl ListenerForm {
                     if rule.host.trim().is_empty() {
                         continue;
                     }
-                    let upstreams: Vec<_> = rule
-                        .upstreams_text
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .enumerate()
-                        .map(|(idx, line)| to_upstream_payload(idx, line, &self.protocol))
-                        .collect::<Result<_, _>>()?;
-                    if upstreams.is_empty() && rule.pool.trim().is_empty() {
-                        return Err(format!(
-                            "Host {} must have at least one upstream or a pool",
-                            rule.host
-                        ));
+                    if rule.pool.trim().is_empty() {
+                        return Err(format!("Host {} must select a pool", rule.host));
                     }
+                    let upstreams: Vec<UpstreamPayload> = Vec::new();
                     if !rule.selected_cert.trim().is_empty()
                         && (rule.cert_path.trim().is_empty() || rule.key_path.trim().is_empty())
                     {

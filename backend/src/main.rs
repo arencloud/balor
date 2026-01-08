@@ -2287,6 +2287,13 @@ fn with_health(state: &AppState, mut cfg: ListenerConfig) -> ListenerConfig {
     for upstream in cfg.upstreams.iter_mut() {
         upstream.healthy = Some(*health.get(&upstream.id).unwrap_or(&false));
     }
+    if let Some(routes) = cfg.host_routes.as_mut() {
+        for route in routes.iter_mut() {
+            for upstream in route.upstreams.iter_mut() {
+                upstream.healthy = Some(*health.get(&upstream.id).unwrap_or(&false));
+            }
+        }
+    }
     cfg
 }
 
