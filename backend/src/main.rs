@@ -1155,7 +1155,7 @@ impl ListenerPayload {
             return Err("TLS paths and ACME cannot both be set; choose one".into());
         }
 
-        let upstreams = if protocol == Protocol::Http {
+        let mut upstreams = if protocol == Protocol::Http {
             upstreams
                 .into_iter()
                 .map(|mut u| {
@@ -1183,11 +1183,15 @@ impl ListenerPayload {
         if protocol == Protocol::Tcp && upstreams.is_empty() {
             return Err("at least one upstream is required".into());
         }
-        if protocol == Protocol::Http
-            && upstreams.is_empty()
-            && host_routes.as_ref().map_or(true, |r| r.is_empty())
-        {
-            return Err("at least one host route or fallback upstream is required".into());
+        if protocol == Protocol::Http {
+            let has_routes = host_routes.as_ref().map_or(false, |r| !r.is_empty());
+            if !has_routes && upstreams.is_empty() {
+                return Err("at least one host route or fallback upstream is required".into());
+            }
+            if has_routes {
+                // Prefer host-routes only; clear fallback upstreams to avoid duplicate health checks.
+                upstreams = Vec::new();
+            }
         }
 
         Ok(ListenerConfig {
