@@ -1822,7 +1822,7 @@ fn app() -> Html {
                         </section>
                     },
                     Tab::Users => html! {
-                        <section class="panel users-panel" key="users-pane">
+                        <section class="panel users-panel" key={format!("users-pane-{}", users.len())} style="position:relative; isolation:isolate; z-index:0;">
                             <div class="panel-head">
                                 <h2>{"Users"}</h2>
                                 <p class="muted">{"RBAC: Admin, Operator, Viewer"}</p>
