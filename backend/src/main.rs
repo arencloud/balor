@@ -560,6 +560,7 @@ async fn main() -> anyhow::Result<()> {
 
     hydrate_supervisor(state.clone()).await?;
     spawn_health_monitor(state.clone());
+    spawn_acme_renewer(state.clone());
 
     let api = Router::new()
         .route("/health", get(health))
@@ -1422,6 +1423,12 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
                     match obtain_cert(route.host.clone(), acme.clone(), state.clone()).await {
                         Ok(tls) => {
                             route.tls = Some(tls);
+                            register_certificate(
+                                &state,
+                                route.host.clone(),
+                                route.tls.as_ref().unwrap(),
+                                "acme",
+                            );
                             route.acme_status = Some(AcmeStatus {
                                 state: AcmeState::Issued,
                                 message: None,
@@ -1520,7 +1527,9 @@ async fn obtain_cert(host: String, acme: AcmeConfig, state: AppState) -> anyhow:
                             let chall = auth.dns_challenge();
                             let proof = chall.dns_proof();
                             perform_dns01(provider_name, &host, &proof, &state)?;
-                            chall.validate(5000)?;
+                            // Give DNS a moment to propagate, then validate with a longer window.
+                            thread::sleep(Duration::from_secs(15));
+                            chall.validate(30000)?;
                         } else {
                             return Err(anyhow::anyhow!(
                                 "DNS-01 requires provider configuration for {}",
@@ -1711,6 +1720,21 @@ fn cert_not_after(path: String) -> Option<String> {
     let not_after = parsed.validity().not_after.to_datetime();
     let dt = DateTime::<Utc>::from_timestamp(not_after.unix_timestamp(), not_after.nanosecond())?;
     Some(dt.to_rfc3339())
+}
+
+fn register_certificate(state: &AppState, name: String, tls: &TlsConfig, source: &str) {
+    let mut store = state.store.write();
+    let bundle = CertificateBundle {
+        name: name.clone(),
+        cert_path: tls.cert_path.clone(),
+        key_path: tls.key_path.clone(),
+        source: source.to_string(),
+    };
+    if let Some(existing) = store.certificates.iter_mut().find(|c| c.name == name) {
+        *existing = bundle;
+    } else {
+        store.certificates.push(bundle);
+    }
 }
 
 impl BalancerSupervisor {
@@ -2791,6 +2815,57 @@ fn spawn_health_monitor(state: AppState) {
             run_health_cycle(&state, &client).await;
         }
     });
+}
+
+fn spawn_acme_renewer(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(12 * 60 * 60)); // twice a day
+        loop {
+            interval.tick().await;
+            run_acme_renewal(&state).await;
+        }
+    });
+}
+
+async fn run_acme_renewal(state: &AppState) {
+    let listeners: Vec<Uuid> = {
+        let store = state.store.read();
+        store.listeners.keys().cloned().collect()
+    };
+    for id in listeners {
+        let config = {
+            let store = state.store.read();
+            store.listeners.get(&id).cloned()
+        };
+        if let Some(cfg) = config {
+            let mut needs = false;
+            if let Some(routes) = cfg.host_routes.as_ref() {
+                for route in routes {
+                    if route.acme.is_some() {
+                        if route
+                            .acme_status
+                            .as_ref()
+                            .and_then(|s| s.not_after.as_ref())
+                            .and_then(|na| DateTime::parse_from_rfc3339(na).ok())
+                            .map(|exp| {
+                                let exp_utc = exp.with_timezone(&Utc);
+                                (exp_utc - Utc::now()).num_days() <= 15
+                            })
+                            .unwrap_or(true)
+                        {
+                            needs = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if needs {
+                if let Err(err) = ensure_acme_for_listener(state.clone(), id).await {
+                    warn!("ACME renewal for listener {id} failed: {err:?}");
+                }
+            }
+        }
+    }
 }
 
 async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
