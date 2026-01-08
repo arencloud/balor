@@ -1967,9 +1967,17 @@ fn render_listener(
                                 } else {
                                     format!("{}", r.host)
                                 };
+                                let tls_label = r
+                                    .tls
+                                    .as_ref()
+                                    .and_then(|t| t.cert_path.rsplit('/').next().map(|s| s.to_string()))
+                                    .unwrap_or_else(|| "No TLS".into());
                                 html!{
                                     <div class="pill-row wrap">
                                         <span class="pill pill-ghost">{host_label}</span>
+                                        <span class={classes!("pill", if r.tls.is_some() { "pill-on" } else { "pill-ghost" })}>
+                                            {format!("TLS: {}", tls_label)}
+                                        </span>
                                         { for r.upstreams.iter().map(|u| {
                                             let (status, class) = match u.healthy {
                                                 Some(true) => ("up", "pill pill-on"),
