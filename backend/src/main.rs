@@ -1419,7 +1419,7 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
                     .map(|t| !FsPath::new(&t.cert_path).exists())
                     .unwrap_or(true);
                 if needs_cert {
-                    match obtain_http01_cert(route.host.clone(), acme.clone()).await {
+                    match obtain_cert(route.host.clone(), acme.clone(), state.clone()).await {
                         Ok(tls) => {
                             route.tls = Some(tls);
                             route.acme_status = Some(AcmeStatus {
@@ -1467,7 +1467,7 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
     Ok(())
 }
 
-async fn obtain_http01_cert(host: String, acme: AcmeConfig) -> anyhow::Result<TlsConfig> {
+async fn obtain_cert(host: String, acme: AcmeConfig, state: AppState) -> anyhow::Result<TlsConfig> {
     let host = host.split(':').next().unwrap_or("").to_string();
     let cert_dir = std::env::var("BALOR_CERT_DIR").unwrap_or_else(|_| "data/certs".into());
     let cache_dir = acme
@@ -1516,14 +1516,17 @@ async fn obtain_http01_cert(host: String, acme: AcmeConfig) -> anyhow::Result<Tl
                         chall.validate(5000)?;
                     }
                     AcmeChallenge::Dns01 => {
-                        warn!(
-                            "DNS-01 selected for host {}, but DNS automation is not yet implemented",
-                            host
-                        );
-                        return Err(anyhow::anyhow!(
-                            "DNS-01 automation not yet implemented for {}",
-                            host
-                        ));
+                        if let Some(provider_name) = &acme.provider {
+                            let chall = auth.dns_challenge();
+                            let proof = chall.dns_proof();
+                            perform_dns01(provider_name, &host, &proof, &state)?;
+                            chall.validate(5000)?;
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "DNS-01 requires provider configuration for {}",
+                                host
+                            ));
+                        }
                     }
                 }
             }
@@ -1556,6 +1559,109 @@ async fn obtain_http01_cert(host: String, acme: AcmeConfig) -> anyhow::Result<Tl
     .await??;
 
     Ok(tls)
+}
+
+fn perform_dns01(
+    provider_name: &str,
+    host: &str,
+    proof: &str,
+    state: &AppState,
+) -> anyhow::Result<()> {
+    let providers = {
+        let store = state.store.read();
+        store.acme_providers.clone()
+    };
+    let Some(provider) = providers.iter().find(|p| p.name == provider_name) else {
+        return Err(anyhow::anyhow!(
+            "DNS provider '{}' not configured",
+            provider_name
+        ));
+    };
+
+    match provider.provider {
+        DnsProvider::Cloudflare => update_cloudflare_dns(provider, host, proof),
+        DnsProvider::Route53 => Err(anyhow::anyhow!(
+            "Route53 automation not implemented yet; use Cloudflare or HTTP-01"
+        )),
+        DnsProvider::Generic => Err(anyhow::anyhow!(
+            "Generic DNS provider automation not implemented"
+        )),
+    }
+}
+
+fn update_cloudflare_dns(
+    provider: &AcmeProviderConfig,
+    host: &str,
+    proof: &str,
+) -> anyhow::Result<()> {
+    let zone = provider
+        .zone
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Cloudflare zone identifier required"))?;
+    let token = provider
+        .api_token
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Cloudflare API token required"))?;
+    let api_base = provider
+        .api_base
+        .clone()
+        .unwrap_or_else(|| "https://api.cloudflare.com/client/v4".into());
+
+    let name = format!(
+        "{}.{}",
+        provider
+            .txt_prefix
+            .clone()
+            .unwrap_or_else(|| "_acme-challenge".into()),
+        host
+    );
+    let value = proof;
+    let agent = ureq::agent();
+
+    // Delete existing TXT records for this name (best effort).
+    let list_url = format!(
+        "{api_base}/zones/{zone}/dns_records?type=TXT&name={}",
+        urlencoding::encode(&name)
+    );
+    if let Ok(resp) = agent
+        .get(&list_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        let val: serde_json::Value = resp.into_json().unwrap_or_default();
+        if let Some(arr) = val.get("result").and_then(|r| r.as_array()) {
+            for entry in arr {
+                if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                    let del_url = format!("{api_base}/zones/{zone}/dns_records/{id}");
+                    let _ = agent
+                        .delete(&del_url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .call();
+                }
+            }
+        }
+    }
+
+    // Create TXT record
+    let create_url = format!("{api_base}/zones/{zone}/dns_records");
+    let body = serde_json::json!({
+        "type": "TXT",
+        "name": name,
+        "content": value,
+        "ttl": 120
+    });
+    let resp = agent
+        .post(&create_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(body)?;
+
+    if !(200..300).contains(&resp.status()) {
+        return Err(anyhow::anyhow!(
+            "Cloudflare DNS update failed: {}",
+            resp.into_string().unwrap_or_default()
+        ));
+    }
+    Ok(())
 }
 
 fn cert_not_after(path: String) -> Option<String> {
@@ -2627,6 +2733,13 @@ fn with_health(state: &AppState, mut cfg: ListenerConfig) -> ListenerConfig {
         for route in routes.iter_mut() {
             for upstream in route.upstreams.iter_mut() {
                 upstream.healthy = Some(*health.get(&upstream.id).unwrap_or(&false));
+            }
+            if route.acme.is_some() && route.acme_status.is_none() {
+                route.acme_status = Some(AcmeStatus {
+                    state: AcmeState::Pending,
+                    message: None,
+                    not_after: None,
+                });
             }
         }
     }
