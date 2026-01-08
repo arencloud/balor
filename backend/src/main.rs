@@ -1740,8 +1740,13 @@ async fn proxy_http(
             builder = builder.header(key, value);
         }
     }
-    if !upstream_host.is_empty() {
-        builder = builder.header(header::HOST, upstream_host.clone());
+    let forward_host = if !upstream_host.is_empty() {
+        upstream_host.clone()
+    } else {
+        client_host.clone().unwrap_or_default()
+    };
+    if !forward_host.is_empty() {
+        builder = builder.header(header::HOST, forward_host);
     }
     builder = builder
         .header("x-forwarded-for", client_ip)
