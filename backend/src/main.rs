@@ -1617,13 +1617,14 @@ fn update_cloudflare_dns(
         .unwrap_or_else(|| "https://api.cloudflare.com/client/v4".into());
     let zone = resolve_cloudflare_zone_id(&api_base, &token, &zone_hint)?;
 
+    let wildcard_fixed = host.trim_start_matches("*."); // ACME TXT uses base domain, not *.
     let name = format!(
         "{}.{}",
         provider
             .txt_prefix
             .clone()
             .unwrap_or_else(|| "_acme-challenge".into()),
-        host
+        wildcard_fixed
     );
     let value = proof;
     let agent = ureq::agent();
@@ -1831,7 +1832,7 @@ impl HttpProxyState {
             .map(|h| h.to_lowercase())
             .map(|h| h.split(':').next().unwrap_or("").to_string());
         let enabled: Vec<_> = if let Some(h) = host {
-            if let Some(rule) = self.host_routes.iter().find(|r| r.host == h) {
+            if let Some(rule) = select_route(&h, &self.host_routes) {
                 rule.upstreams
                     .iter()
                     .filter(|u| u.enabled && *health.get(&u.id).unwrap_or(&true))
@@ -2478,6 +2479,7 @@ async fn load_certified_key(cert_path: &str, key_path: &str) -> anyhow::Result<C
 
 async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<RustlsConfig> {
     let mut hosts: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
+    let mut wildcards: Vec<(String, Arc<CertifiedKey>)> = Vec::new();
     let mut default_key: Option<Arc<CertifiedKey>> = None;
 
     if let Some(tls) = &listener.tls {
@@ -2491,7 +2493,11 @@ async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<Ru
             if let Some(tls) = &route.tls {
                 let key = Arc::new(load_certified_key(&tls.cert_path, &tls.key_path).await?);
                 let hostname = route.host.split(':').next().unwrap_or("").to_lowercase();
-                hosts.insert(hostname, key.clone());
+                if hostname.starts_with("*.") {
+                    wildcards.push((hostname.trim_start_matches("*.").to_string(), key.clone()));
+                } else {
+                    hosts.insert(hostname, key.clone());
+                }
                 if default_key.is_none() {
                     default_key = Some(key);
                 }
@@ -2503,7 +2509,11 @@ async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<Ru
         anyhow::bail!("no TLS certificates configured");
     };
 
-    let sni_resolver = Arc::new(ManualSniResolver { hosts, default_key });
+    let sni_resolver = Arc::new(ManualSniResolver {
+        hosts,
+        wildcards,
+        default_key,
+    });
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -2514,6 +2524,7 @@ async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<Ru
 #[derive(Debug)]
 struct ManualSniResolver {
     hosts: HashMap<String, Arc<CertifiedKey>>,
+    wildcards: Vec<(String, Arc<CertifiedKey>)>,
     default_key: Arc<CertifiedKey>,
 }
 
@@ -2524,10 +2535,42 @@ impl ResolvesServerCert for ManualSniResolver {
             if let Some(key) = self.hosts.get(&name) {
                 return Some(key.clone());
             }
+            for (suffix, key) in self.wildcards.iter() {
+                if name.ends_with(suffix) && name.len() > suffix.len() {
+                    return Some(key.clone());
+                }
+            }
         }
         // Fallback to default cert.
         self.default_key.clone().into()
     }
+}
+
+fn select_route<'a>(host: &str, routes: &'a [HostRule]) -> Option<&'a HostRule> {
+    if let Some(exact) = routes
+        .iter()
+        .find(|r| !r.host.starts_with("*.") && r.host == host)
+    {
+        return Some(exact);
+    }
+    let mut wildcard_match: Option<&HostRule> = None;
+    for route in routes.iter().filter(|r| r.host.starts_with("*.")) {
+        let suffix = route.host.trim_start_matches("*.");
+        if host.ends_with(suffix) && host.len() > suffix.len() {
+            wildcard_match = match wildcard_match {
+                Some(current) => {
+                    let curr_suf = current.host.trim_start_matches("*.");
+                    if suffix.len() > curr_suf.len() {
+                        Some(route)
+                    } else {
+                        Some(current)
+                    }
+                }
+                None => Some(route),
+            };
+        }
+    }
+    wildcard_match
 }
 
 async fn try_acme_challenge(path: &str) -> Option<Response<Body>> {
