@@ -93,3 +93,9 @@ Environment knobs:
 - ACME provider type auto-sets API base URLs (Cloudflare/Route53) with overrides allowed.
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.
 - Browser support note: Chrome/Chromium render the admin dashboard fully; Firefox currently has partial support for the Users/Metrics tabs (layout issues under investigation).
+
+## Feature status (near-term)
+- ✅ Persistent config store, listener health checks, TLS termination (hot reload), sticky sessions, RBAC, metrics, cookie rewrite, SNI multi-cert, host-based routing, pool-backed listeners (HTTP/TCP), Certificates dashboard, WebSocket pass-through.
+- ✅ TCP listeners reuse upstream pools (UI hydrates endpoints).
+- ⚠️ ACME automation: HTTP-01 + Cloudflare DNS-01 with periodic renewal; Route53/Generic DNS-01 and renewal/backoff polish still pending.
+- ⚠️ Firefox UI: Users/Metrics tabs have known layout issues (Chrome/Chromium fully supported).
