@@ -92,7 +92,7 @@ Environment knobs:
 - Certificates dashboard: upload/download manual PEM bundles (stored under `BALOR_CERT_DIR`, default `data/certs`) from the Admin UI Certificates tab.
 - ACME provider type auto-sets API base URLs (Cloudflare/Route53) with overrides allowed.
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.
-- Browser support note: Chrome/Chromium render the admin dashboard fully; Firefox currently has partial support for the Users/Metrics tabs (layout issues under investigation).
+- Browser support note: Chrome/Chromium and Firefox are both supported; Users/Metrics views were refactored to avoid the previous Firefox layout crash.
 
 ## Feature status (near-term)
 - ✅ Persistent config store
@@ -107,4 +107,4 @@ Environment knobs:
 - ✅ WebSocket pass-through
 - ✅ Certificates dashboard (manual PEM upload/download; ACME-issued certs register)
 - ⚠️ ACME automation: HTTP-01 + Cloudflare DNS-01 with periodic renewal; Route53/Generic DNS-01 and renewal/backoff polish pending
-- ⚠️ Browser support: Chrome/Chromium fully supported; Firefox has known layout issues (Users/Metrics tabs)
+- ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes
