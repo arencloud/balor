@@ -3050,6 +3050,9 @@ async fn parse_json_response<T: for<'de> Deserialize<'de>>(
     let body = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
 
     if !resp.ok() {
+        if status == 401 {
+            clear_session_storage();
+        }
         return Err(format!("{status}: {body}"));
     }
 
