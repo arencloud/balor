@@ -95,7 +95,16 @@ Environment knobs:
 - Browser support note: Chrome/Chromium render the admin dashboard fully; Firefox currently has partial support for the Users/Metrics tabs (layout issues under investigation).
 
 ## Feature status (near-term)
-- ✅ Persistent config store, listener health checks, TLS termination (hot reload), sticky sessions, RBAC, metrics, cookie rewrite, SNI multi-cert, host-based routing, pool-backed listeners (HTTP/TCP), Certificates dashboard, WebSocket pass-through.
-- ✅ TCP listeners reuse upstream pools (UI hydrates endpoints).
-- ⚠️ ACME automation: HTTP-01 + Cloudflare DNS-01 with periodic renewal; Route53/Generic DNS-01 and renewal/backoff polish still pending.
-- ⚠️ Firefox UI: Users/Metrics tabs have known layout issues (Chrome/Chromium fully supported).
+- Persistent config store: ✅
+- Health checks (HTTP/TCP): ✅
+- TLS termination (hot reload, per-host SNI): ✅
+- Sticky sessions (cookie/IP hash): ✅
+- RBAC (admin/operator/viewer): ✅
+- Metrics (Prometheus HTTP/TCP): ✅
+- Cookie rewrite to client host: ✅
+- Host-based routing & SNI multi-cert: ✅
+- Pools dashboard; listeners/pools reuse: ✅
+- WebSocket pass-through: ✅
+- ACME automation: ⚠️ HTTP-01 + Cloudflare DNS-01 + periodic renewal; Route53/Generic DNS-01 and renewal/backoff polish pending.
+- Certificates dashboard (manual PEM upload/download; ACME-issued certs register): ✅
+- Browser support: ⚠️ Chrome/Chromium fully supported; Firefox has known layout issues (Users/Metrics tabs).
