@@ -106,5 +106,6 @@ Environment knobs:
 - ✅ Pools dashboard; listeners/pools reuse
 - ✅ WebSocket pass-through
 - ✅ Certificates dashboard (manual PEM upload/download; ACME-issued certs register)
+- ✅ Version banner: UI/API/build version surfaced via `/api/version` and shown in the header
 - ⚠️ ACME automation: HTTP-01 + Cloudflare DNS-01 with periodic renewal; Route53/Generic DNS-01 and renewal/backoff polish pending
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes

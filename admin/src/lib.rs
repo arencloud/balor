@@ -322,6 +322,7 @@ fn app() -> Html {
     let pools = use_state(Vec::<UpstreamPool>::new);
     let pool_form = use_state(UpstreamPoolForm::default);
     let pool_status = use_state(StatusLine::default);
+    let version_info = use_state(|| None::<VersionInfo>);
 
     let handle_error = {
         let status = status.clone();
@@ -347,6 +348,7 @@ fn app() -> Html {
         let handle_error_cert = handle_error.clone();
         let pools_state = pools.clone();
         let handle_error_pools = handle_error.clone();
+        let version_state = version_info.clone();
         use_effect_with((*tab).clone(), move |current_tab: &Tab| {
             let metrics_text = metrics_text.clone();
             let metrics_rows = metrics_rows.clone();
@@ -357,6 +359,7 @@ fn app() -> Html {
             let handle_error_cert = handle_error_cert.clone();
             let pools_state = pools_state.clone();
             let handle_error_pools = handle_error_pools.clone();
+            let version_state = version_state.clone();
             if *current_tab == Tab::Metrics {
                 spawn_local(async move {
                     if session.is_none() {
@@ -396,6 +399,13 @@ fn app() -> Html {
                         }
                     }
                 });
+            } else if version_state.is_none() {
+                spawn_local(async move {
+                    match api_version().await {
+                        Ok(ver) => version_state.set(Some(ver)),
+                        Err(err) => handle_error(err),
+                    }
+                });
             }
             || ()
         });
@@ -410,6 +420,7 @@ fn app() -> Html {
         let acme_providers = acme_providers.clone();
         let certs = certs.clone();
         let pools = pools.clone();
+        let version_state = version_info.clone();
         let handle_error = handle_error.clone();
         let status = status.clone();
         use_effect_with((*session).clone(), move |current: &Option<Session>| {
@@ -439,6 +450,11 @@ fn app() -> Html {
                         }
                         if let Ok(pools_resp) = api_pools().await {
                             pools.set(pools_resp);
+                        }
+                    }
+                    if version_state.is_none() {
+                        if let Ok(ver) = api_version().await {
+                            version_state.set(Some(ver));
                         }
                     }
                     loading.set(false);
@@ -786,8 +802,17 @@ fn app() -> Html {
                     <h2 class="stat-value">{ (*stats).active_runtimes }</h2>
                 </div>
                 <div class="stat">
-                    <p class="eyebrow">{"UI / API"}</p>
-                    <h2 class="stat-value">{"Axum + Yew"}</h2>
+                    <p class="eyebrow">{"Version"}</p>
+                    {
+                        if let Some(ver) = (*version_info).clone() {
+                            let ui = ver.ui_version.clone();
+                            let api = ver.api_version.clone();
+                            let build = ver.build.clone();
+                            html!{ <h2 class="stat-value">{format!("UI {ui} • API {api} • {build}")}</h2> }
+                        } else {
+                            html!{ <h2 class="stat-value">{"Loading..."}</h2> }
+                        }
+                    }
                 </div>
             </section>
 
@@ -2755,6 +2780,13 @@ struct MetricRow {
     value: f64,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+struct VersionInfo {
+    api_version: String,
+    ui_version: String,
+    build: String,
+}
+
 fn parse_metrics_summary(body: &str) -> Vec<MetricRow> {
     let mut rows = Vec::new();
     for line in body.lines() {
@@ -2822,6 +2854,14 @@ async fn api_stats() -> Result<Stats, String> {
         .map_err(|e| format!("request failed: {e}"))?;
 
     parse_json_response::<Stats>(resp).await
+}
+
+async fn api_version() -> Result<VersionInfo, String> {
+    let resp = Request::get("/api/version")
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<VersionInfo>(resp).await
 }
 
 async fn api_metrics() -> Result<String, String> {

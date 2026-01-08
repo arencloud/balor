@@ -481,6 +481,13 @@ struct LoginResponse {
     role: Role,
 }
 
+#[derive(Debug, Serialize)]
+struct VersionResponse {
+    api_version: String,
+    ui_version: String,
+    build: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct LogoutPayload {
     token: String,
@@ -564,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
 
     let api = Router::new()
         .route("/health", get(health))
+        .route("/version", get(version_info))
         .route("/login", post(login))
         .route("/logout", post(logout))
         .merge(
@@ -656,6 +664,17 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         active_runtimes: state.supervisor.active_runtimes(),
     };
     Json(response)
+}
+
+async fn version_info() -> Json<VersionResponse> {
+    let api_version = env!("CARGO_PKG_VERSION").to_string();
+    let ui_version = std::env::var("BALOR_UI_VERSION").unwrap_or_else(|_| api_version.clone());
+    let build = std::env::var("BALOR_BUILD_ID").unwrap_or_else(|_| "dev".into());
+    Json(VersionResponse {
+        api_version,
+        ui_version,
+        build,
+    })
 }
 
 async fn list_users(
