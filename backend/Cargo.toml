@@ -37,3 +37,5 @@ base64 = "0.22"
 sha1 = "0.10"
 rustls-pemfile = "2"
 acme-lib = "0.9.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+x509-parser = "0.16"

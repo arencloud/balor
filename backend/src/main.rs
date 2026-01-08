@@ -20,6 +20,7 @@ use axum::{
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use hyper_util::rt::TokioIo;
 use parking_lot::RwLock;
@@ -64,6 +65,8 @@ use tower_http::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use x509_parser::prelude::FromDer;
+use x509_parser::prelude::X509Certificate;
 
 const BODY_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -195,6 +198,8 @@ struct HostRulePayload {
     tls: Option<TlsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acme: Option<AcmePayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme_status: Option<AcmeStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +212,8 @@ struct HostRule {
     tls: Option<TlsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acme: Option<AcmeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme_status: Option<AcmeStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +241,23 @@ struct AcmePayload {
     challenge: AcmeChallenge,
     #[serde(default)]
     provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcmeStatus {
+    state: AcmeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    not_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AcmeState {
+    Pending,
+    Issued,
+    Failed,
 }
 
 impl AcmePayload {
@@ -1241,11 +1265,18 @@ impl UpstreamPayload {
 
 impl HostRulePayload {
     fn into_config(self, store: &ConfigStore) -> Result<HostRule, String> {
-        if self.host.trim().is_empty() {
+        let Self {
+            host,
+            upstreams,
+            pool,
+            tls,
+            acme,
+            ..
+        } = self;
+        if host.trim().is_empty() {
             return Err("host value cannot be empty".into());
         }
-        let mut upstreams = self
-            .upstreams
+        let mut upstreams = upstreams
             .into_iter()
             .map(|u| {
                 let mut upstream = u.into_upstream()?;
@@ -1254,7 +1285,7 @@ impl HostRulePayload {
             })
             .collect::<Result<Vec<_>, String>>()?;
         if upstreams.is_empty() {
-            if let Some(pool_name) = &self.pool {
+            if let Some(pool_name) = &pool {
                 if let Some(pool) = store.pools.iter().find(|p| p.name == *pool_name) {
                     upstreams.extend(pool.upstreams.clone());
                 }
@@ -1264,11 +1295,12 @@ impl HostRulePayload {
             return Err("host route must include at least one upstream or pool".into());
         }
         Ok(HostRule {
-            host: self.host.to_lowercase(),
+            host: host.to_lowercase(),
             upstreams,
-            pool: self.pool.clone(),
-            tls: self.tls.map(|t| t.into_config()).transpose()?,
-            acme: self.acme.map(|a| a.into_config()).transpose()?,
+            pool: pool.clone(),
+            tls: tls.map(|t| t.into_config()).transpose()?,
+            acme: acme.map(|a| a.into_config()).transpose()?,
+            acme_status: None,
         })
     }
 }
@@ -1390,12 +1422,34 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
                     match obtain_http01_cert(route.host.clone(), acme.clone()).await {
                         Ok(tls) => {
                             route.tls = Some(tls);
+                            route.acme_status = Some(AcmeStatus {
+                                state: AcmeState::Issued,
+                                message: None,
+                                not_after: cert_not_after(
+                                    route
+                                        .tls
+                                        .as_ref()
+                                        .map(|t| t.cert_path.clone())
+                                        .unwrap_or_default(),
+                                ),
+                            });
                             changed = true;
                         }
                         Err(err) => {
                             warn!("ACME issuance for host {} failed: {err:?}", route.host);
+                            route.acme_status = Some(AcmeStatus {
+                                state: AcmeState::Failed,
+                                message: Some(err.to_string()),
+                                not_after: None,
+                            });
                         }
                     }
+                } else if route.acme_status.is_none() {
+                    route.acme_status = Some(AcmeStatus {
+                        state: AcmeState::Pending,
+                        message: None,
+                        not_after: None,
+                    });
                 }
             }
         }
@@ -1502,6 +1556,20 @@ async fn obtain_http01_cert(host: String, acme: AcmeConfig) -> anyhow::Result<Tl
     .await??;
 
     Ok(tls)
+}
+
+fn cert_not_after(path: String) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let mut reader = std::io::Cursor::new(data);
+    let mut iter = rustls_pemfile::certs(&mut reader);
+    let first = match iter.next()? {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let (_rem, parsed) = X509Certificate::from_der(first.as_ref()).ok()?;
+    let not_after = parsed.validity().not_after.to_datetime();
+    let dt = DateTime::<Utc>::from_timestamp(not_after.unix_timestamp(), not_after.nanosecond())?;
+    Some(dt.to_rfc3339())
 }
 
 impl BalancerSupervisor {

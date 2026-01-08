@@ -109,6 +109,23 @@ struct AcmeConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum AcmeState {
+    Pending,
+    Issued,
+    Failed,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct AcmeStatus {
+    state: AcmeState,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    not_after: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct AcmeProviderConfig {
     name: String,
     provider: DnsProvider,
@@ -170,6 +187,8 @@ struct HostRule {
     tls: Option<TlsConfig>,
     #[serde(default)]
     acme: Option<AcmeConfig>,
+    #[serde(default)]
+    acme_status: Option<AcmeStatus>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -212,6 +231,8 @@ struct HostRulePayload {
     tls: Option<TlsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acme: Option<AcmeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme_status: Option<AcmeStatus>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2019,15 +2040,41 @@ fn render_listener(
                                 } else {
                                     format!("{}", r.host)
                                 };
-                                let tls_label = r
-                                    .tls
-                                    .as_ref()
-                                    .and_then(|t| t.cert_path.rsplit('/').next().map(|s| s.to_string()))
-                                    .unwrap_or_else(|| "No TLS".into());
+                                let (tls_label, tls_class) = if let Some(status) = &r.acme_status {
+                                    match status.state {
+                                        AcmeState::Issued => {
+                                            let until = status
+                                                .not_after
+                                                .clone()
+                                                .unwrap_or_else(|| "issued".into());
+                                            (format!("ACME: valid until {until}"), "pill pill-on")
+                                        }
+                                        AcmeState::Pending => {
+                                            ("ACME pending".into(), "pill pill-ghost")
+                                        }
+                                        AcmeState::Failed => {
+                                            let msg = status
+                                                .message
+                                                .clone()
+                                                .unwrap_or_else(|| "error".into());
+                                            (format!("ACME failed: {msg}"), "pill pill-error")
+                                        }
+                                    }
+                                } else if let Some(t) = r.tls.as_ref() {
+                                    let name = t
+                                        .cert_path
+                                        .rsplit('/')
+                                        .next()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| "TLS".into());
+                                    (name, "pill pill-on")
+                                } else {
+                                    ("No TLS".into(), "pill pill-ghost")
+                                };
                                 html!{
                                     <div class="pill-row wrap">
                                         <span class="pill pill-ghost">{host_label}</span>
-                                        <span class={classes!("pill", if r.tls.is_some() { "pill-on" } else { "pill-ghost" })}>
+                                        <span class={classes!(tls_class)}>
                                             {format!("TLS: {}", tls_label)}
                                         </span>
                                         { for r.upstreams.iter().map(|u| {
@@ -2493,6 +2540,7 @@ impl ListenerForm {
                         } else {
                             None
                         },
+                        acme_status: None,
                     });
                 }
                 Some(routes)
