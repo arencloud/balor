@@ -27,7 +27,10 @@ use prometheus::{
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use rand_core::OsRng;
+use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::ResolvesServerCertUsingSni;
+use rustls::sign::CertifiedKey;
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -1527,12 +1530,6 @@ async fn run_http_listener(
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config.listen.parse()?;
-    let tls_fallback = config.tls.clone().or_else(|| {
-        config
-            .host_routes
-            .as_ref()
-            .and_then(|routes| routes.iter().find_map(|r| r.tls.clone()))
-    });
 
     let state = HttpProxyState::new(
         config.id,
@@ -1567,12 +1564,16 @@ async fn run_http_listener(
         config.upstreams.len()
     );
 
-    if let Some(tls) = tls_fallback {
-        let tls_config = load_rustls_config(&tls.cert_path, &tls.key_path).await?;
-        info!(
-            "TLS enabled for '{}' using cert={} key={} (listener or host-route)",
-            config.name, tls.cert_path, tls.key_path
-        );
+    // Build SNI-aware rustls config from listener + host routes.
+    let tls_available = config.tls.is_some()
+        || config
+            .host_routes
+            .as_ref()
+            .map_or(false, |routes| routes.iter().any(|r| r.tls.is_some()));
+
+    if tls_available {
+        let tls_config = build_sni_rustls_config(&config).await?;
+        info!("TLS enabled for '{}' (SNI resolver active)", config.name);
         let handle = Handle::new();
         let server = axum_server::bind_rustls(listen_addr, tls_config)
             .handle(handle.clone())
@@ -1992,6 +1993,7 @@ fn websocket_accept(key: &str) -> String {
     BASE64_STD.encode(digest)
 }
 
+#[allow(dead_code)]
 async fn load_rustls_config(cert_path: &str, key_path: &str) -> anyhow::Result<RustlsConfig> {
     let mut cert_chain: Vec<CertificateDer<'static>> = Vec::new();
     let mut private_key: Option<PrivateKeyDer<'static>> = None;
@@ -2038,6 +2040,88 @@ async fn load_rustls_config(cert_path: &str, key_path: &str) -> anyhow::Result<R
     Ok(RustlsConfig::from_config(std::sync::Arc::new(
         server_config,
     )))
+}
+
+async fn load_certified_key(cert_path: &str, key_path: &str) -> anyhow::Result<CertifiedKey> {
+    let mut cert_chain: Vec<CertificateDer<'static>> = Vec::new();
+    let mut private_key: Option<PrivateKeyDer<'static>> = None;
+
+    let cert_bytes = fs::read(cert_path).await?;
+    let mut reader = cert_bytes.as_slice();
+    while let Some(item) = rustls_pemfile::read_one(&mut reader)? {
+        if let rustls_pemfile::Item::X509Certificate(cert) = item {
+            cert_chain.push(cert);
+        }
+    }
+    if cert_chain.is_empty() {
+        anyhow::bail!("no certificates found in {}", cert_path);
+    }
+
+    let key_bytes = fs::read(key_path).await?;
+    let mut key_reader = key_bytes.as_slice();
+    while let Some(item) = rustls_pemfile::read_one(&mut key_reader)? {
+        match item {
+            rustls_pemfile::Item::Pkcs8Key(k) => {
+                private_key = Some(PrivateKeyDer::from(k));
+                break;
+            }
+            rustls_pemfile::Item::Sec1Key(k) => {
+                private_key = Some(PrivateKeyDer::from(k));
+                break;
+            }
+            rustls_pemfile::Item::Pkcs1Key(k) => {
+                private_key = Some(PrivateKeyDer::from(k));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let key =
+        private_key.ok_or_else(|| anyhow::anyhow!("no usable private key in {}", key_path))?;
+    let signing_key = any_supported_type(&key)
+        .map_err(|_| anyhow::anyhow!("unsupported key type in {}", key_path))?;
+
+    Ok(CertifiedKey::new(cert_chain, signing_key))
+}
+
+async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<RustlsConfig> {
+    let mut resolver = ResolvesServerCertUsingSni::new();
+
+    let mut default_key: Option<CertifiedKey> = None;
+    if let Some(tls) = &listener.tls {
+        let key = load_certified_key(&tls.cert_path, &tls.key_path).await?;
+        default_key = Some(key.clone());
+        resolver
+            .add("default", key)
+            .map_err(|_| anyhow::anyhow!("failed adding default cert"))?;
+    }
+
+    if let Some(routes) = &listener.host_routes {
+        for route in routes {
+            if let Some(tls) = &route.tls {
+                let key = load_certified_key(&tls.cert_path, &tls.key_path).await?;
+                let hostname = route.host.clone();
+                resolver.add(&hostname, key.clone()).map_err(|_| {
+                    anyhow::anyhow!(format!("failed adding SNI cert for {}", hostname))
+                })?;
+                if default_key.is_none() {
+                    default_key = Some(key);
+                }
+            }
+        }
+    }
+
+    let Some(default_key) = default_key else {
+        anyhow::bail!("no TLS certificates configured");
+    };
+    let _ = resolver.add("localhost", default_key.clone());
+    let _ = resolver.add("127.0.0.1", default_key.clone());
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
+    Ok(RustlsConfig::from_config(Arc::new(server_config)))
 }
 
 async fn try_acme_challenge(path: &str) -> Option<Response<Body>> {
