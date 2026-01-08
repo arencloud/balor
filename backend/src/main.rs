@@ -2099,9 +2099,15 @@ async fn build_sni_rustls_config(listener: &ListenerConfig) -> anyhow::Result<Ru
         for route in routes {
             if let Some(tls) = &route.tls {
                 let key = load_certified_key(&tls.cert_path, &tls.key_path).await?;
-                let hostname = route.host.clone();
-                if resolver.add(&hostname, key.clone()).is_err() {
-                    warn!("SNI add failed for host {}, skipping", hostname);
+                let hostname = route.host.split(':').next().unwrap_or("").to_lowercase();
+                match resolver.add(&hostname, key.clone()) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(
+                            "SNI add failed for host {}: {} (will fall back to default cert)",
+                            hostname, err
+                        );
+                    }
                 }
                 if default_key.is_none() {
                     default_key = Some(key);
