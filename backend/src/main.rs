@@ -1594,10 +1594,10 @@ fn update_cloudflare_dns(
     host: &str,
     proof: &str,
 ) -> anyhow::Result<()> {
-    let zone = provider
+    let zone_hint = provider
         .zone
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("Cloudflare zone identifier required"))?;
+        .ok_or_else(|| anyhow::anyhow!("Cloudflare zone identifier or name required"))?;
     let token = provider
         .api_token
         .clone()
@@ -1606,6 +1606,7 @@ fn update_cloudflare_dns(
         .api_base
         .clone()
         .unwrap_or_else(|| "https://api.cloudflare.com/client/v4".into());
+    let zone = resolve_cloudflare_zone_id(&api_base, &token, &zone_hint)?;
 
     let name = format!(
         "{}.{}",
@@ -1662,6 +1663,40 @@ fn update_cloudflare_dns(
         ));
     }
     Ok(())
+}
+
+fn resolve_cloudflare_zone_id(
+    api_base: &str,
+    token: &str,
+    zone_hint: &str,
+) -> anyhow::Result<String> {
+    // If the hint already looks like a 32-char hex ID, accept it.
+    let is_hex_id = zone_hint.len() == 32 && zone_hint.chars().all(|c| c.is_ascii_hexdigit());
+    if is_hex_id {
+        return Ok(zone_hint.to_string());
+    }
+
+    let list_url = format!("{api_base}/zones?name={}", urlencoding::encode(zone_hint));
+    let resp = ureq::agent()
+        .get(&list_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(anyhow::anyhow!(
+            "Cloudflare zone lookup failed: {}",
+            resp.into_string().unwrap_or_default()
+        ));
+    }
+    let val: serde_json::Value = resp.into_json().unwrap_or_default();
+    let zones = val
+        .get("result")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| anyhow::anyhow!("Unexpected Cloudflare response"))?;
+    let zone_id = zones
+        .iter()
+        .find_map(|z| z.get("id").and_then(|v| v.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("Zone {} not found in Cloudflare", zone_hint))?;
+    Ok(zone_id.to_string())
 }
 
 fn cert_not_after(path: String) -> Option<String> {
