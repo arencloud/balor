@@ -326,8 +326,8 @@ fn app() -> Html {
     let version_info = use_state(|| None::<VersionInfo>);
     let logs = use_state(Vec::<LogEntry>::new);
     let log_filter = use_state(|| "all".to_string());
-    let log_files = use_state(Vec::<LogFileInfo>::new);
-    let log_file_view = use_state(|| None::<(String, String)>);
+    let _log_files = use_state(Vec::<LogFileInfo>::new);
+    let _log_file_view = use_state(|| None::<(String, String)>);
     let log_files = use_state(Vec::<LogFileInfo>::new);
     let log_file_view = use_state(|| None::<(String, String)>);
 
