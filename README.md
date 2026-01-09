@@ -108,6 +108,6 @@ Environment knobs:
 - ✅ Certificates dashboard (manual PEM upload/download; ACME-issued certs register)
 - ✅ Version banner: UI/API/build version surfaced via `/api/version` and shown in the header
 - ✅ Metrics tab now includes latency quantiles (p50/p95/p99) derived from Prometheus buckets with quick visual cards
-- ✅ Logs tab (admin-only): log list with level filter (placeholder until structured logs are wired)
-- ⚠️ ACME automation: HTTP-01 + Cloudflare DNS-01 with periodic renewal; Route53/Generic DNS-01 and renewal/backoff polish pending
+- ✅ Logs tab (admin-only): live buffer view, level filter, and JSONL download/preview from the backend log store (retention + rotation)
+- ⚠️ ACME automation: HTTP-01 + Cloudflare DNS-01 with periodic renewal; Route53/Generic DNS-01 and renewal/backoff polish pending; existing ACME certs are reused on edit to avoid needless re-issuance
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes

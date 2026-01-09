@@ -13,6 +13,10 @@ use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Protocol {
@@ -180,6 +184,8 @@ struct UpstreamPool {
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct HostRule {
     host: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
     upstreams: Vec<Upstream>,
     #[serde(default)]
     pool: Option<String>,
@@ -197,6 +203,8 @@ struct Listener {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default = "default_true")]
+    enabled: bool,
     upstreams: Vec<Upstream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_routes: Option<Vec<HostRule>>,
@@ -224,6 +232,8 @@ struct UpstreamPoolPayload {
 #[derive(Clone, Serialize, Deserialize)]
 struct HostRulePayload {
     host: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
     upstreams: Vec<UpstreamPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pool: Option<String>,
@@ -240,6 +250,8 @@ struct ListenerPayload {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default = "default_true")]
+    enabled: bool,
     upstreams: Vec<UpstreamPayload>,
     #[serde(default)]
     host_routes: Option<Vec<HostRulePayload>>,
@@ -268,6 +280,8 @@ struct UserPayload {
 #[derive(Clone, Serialize, Deserialize)]
 struct HostRuleForm {
     host: String,
+    enabled: bool,
+    tls_enabled: bool,
     upstreams_text: String,
     pool: String,
     selected_cert: String,
@@ -971,6 +985,28 @@ fn app() -> Html {
                                             <option value="ip_hash" selected={form.sticky == StickyMode::IpHash}>{"Client IP hash"}</option>
                                         </select>
                                     </label>
+                                    <label class="field">
+                                        <span>{"Enabled"}</span>
+                                        <div style="display:flex; align-items:center; gap:10px;">
+                                            <span class={classes!("pill", if form.enabled { "pill-on" } else { "pill-error" })}>
+                                                { if form.enabled { "On" } else { "Off" } }
+                                            </span>
+                                            <input
+                                                type="checkbox"
+                                                aria-label="Toggle listener enabled"
+                                                checked={form.enabled}
+                                                onchange={{
+                                                    let form = form.clone();
+                                                    Callback::from(move |e: Event| {
+                                                        let mut next = (*form).clone();
+                                                        next.enabled = checkbox_checked(&e);
+                                                        form.set(next);
+                                                    })
+                                                }}
+                                                style="width:18px; height:18px; accent-color:#2563eb;"
+                                            />
+                                        </div>
+                                    </label>
                                     {
                                         if form.protocol == Protocol::Tcp {
                                             html!{
@@ -1060,6 +1096,59 @@ fn app() -> Html {
                                                                             />
                                                                         </label>
                                                                         <span class="pill pill-ghost">{format!("Route {}", idx + 1)}</span>
+                                                                        <div style="display:flex; align-items:center; gap:10px;">
+                                                                            <label style="display:flex; align-items:center; gap:8px; padding:6px 12px; border-radius:12px; background:linear-gradient(120deg,#eef2ff,#f8fafc); box-shadow:0 6px 18px rgba(15,23,42,0.08);">
+                                                                                <span class="muted">{"Enabled"}</span>
+                                                                                <span class={classes!("pill", if rule.enabled { "pill-on" } else { "pill-error" })}>
+                                                                                    { if rule.enabled { "On" } else { "Off" } }
+                                                                                </span>
+                                                                                <input
+                                                                                    type="checkbox"
+                                                                                    aria-label="Toggle host route enabled"
+                                                                                    checked={rule.enabled}
+                                                                                    onchange={{
+                                                                                        let form = form.clone();
+                                                                                        Callback::from(move |e: Event| {
+                                                                                            let mut next = (*form).clone();
+                                                                                            if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                r.enabled = checkbox_checked(&e);
+                                                                                            }
+                                                                                            form.set(next);
+                                                                                        })
+                                                                                    }}
+                                                                                    style="width:16px; height:16px; accent-color:#2563eb;"
+                                                                                />
+                                                                            </label>
+                                                                            <label style="display:flex; align-items:center; gap:8px; padding:6px 12px; border-radius:12px; background:linear-gradient(120deg,#e7f5ff,#f0fbff); box-shadow:0 6px 18px rgba(15,23,42,0.08);">
+                                                                                <span class="muted">{"TLS/ACME"}</span>
+                                                                                <span class={classes!("pill", if rule.tls_enabled { "pill-on" } else { "pill-error" })}>
+                                                                                    { if rule.tls_enabled { "On" } else { "Off" } }
+                                                                                </span>
+                                                                                <input
+                                                                                    type="checkbox"
+                                                                                    aria-label="Toggle TLS/ACME for host"
+                                                                                    checked={rule.tls_enabled}
+                                                                                    onchange={{
+                                                                                        let form = form.clone();
+                                                                                        Callback::from(move |e: Event| {
+                                                                                            let mut next = (*form).clone();
+                                                                                            if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                r.tls_enabled = checkbox_checked(&e);
+                                                                                                if !r.tls_enabled {
+                                                                                                    r.acme_enabled = false;
+                                                                                                    r.selected_cert.clear();
+                                                                                                    r.cert_path.clear();
+                                                                                                    r.key_path.clear();
+                                                                                                    r.acme_provider.clear();
+                                                                                                }
+                                                                                            }
+                                                                                            form.set(next);
+                                                                                        })
+                                                                                    }}
+                                                                                    style="width:16px; height:16px; accent-color:#2563eb;"
+                                                                                />
+                                                                            </label>
+                                                                        </div>
                                                                         <button class="ghost pill" type="button" disabled={form.host_rules.len() == 1} onclick={{
                                                                             let form = form.clone();
                                                                             Callback::from(move |_| {
@@ -1069,171 +1158,215 @@ fn app() -> Html {
                                                                             })
                                                                         }}>{"Remove"}</button>
                                                                     </div>
-                                                                    <label class="field" style="grid-column: span 6;">
-                                                                        <span>{"Pool"}</span>
-                                                                        <select
-                                                                            onchange={{
-                                                                                let form = form.clone();
-                                                                                Callback::from(move |e: Event| {
-                                                                                    let mut next = (*form).clone();
-                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
-                                                                                        r.pool = select_value(&e).unwrap_or_default();
-                                                                                    }
-                                                                                    form.set(next);
-                                                                                })
-                                                                            }}
-                                                                        >
-                                                                            <option value="" selected={rule.pool.is_empty()}>{"Select pool (required)"}</option>
-                                                                            { for pools.iter().map(|p| {
-                                                                                html!{ <option value={p.name.clone()} selected={rule.pool == p.name}>{&p.name}</option> }
-                                                                            })}
-                                                                        </select>
-                                                                    </label>
-                                                                    <label class="field" style="grid-column: span 6;">
-                                                                        <span>{"Dedicated certificate (optional)"}</span>
-                                                                        <select
-                                                                            disabled={rule.acme_enabled}
-                                                                            onchange={{
-                                                                                let form = form.clone();
-                                                                                let certs = certs.clone();
-                                                                                Callback::from(move |e: Event| {
-                                                                                    let mut next = (*form).clone();
-                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
-                                                                                        let name = select_value(&e).unwrap_or_default();
-                                                                                        r.selected_cert = name.clone();
-                                                                                        if let Some(bundle) = certs.iter().find(|c| c.name == name) {
-                                                                                            r.cert_path = bundle.cert_path.clone();
-                                                                                            r.key_path = bundle.key_path.clone();
-                                                                                        } else {
-                                                                                            r.cert_path.clear();
-                                                                                            r.key_path.clear();
-                                                                                        }
-                                                                                    }
-                                                                                    form.set(next);
-                                                                                })
-                                                                            }}
-                                                                        >
-                                                                            <option value="" selected={rule.selected_cert.is_empty()}>{"Use listener/default"}</option>
-                                                                            { for certs.iter().map(|c| {
-                                                                                html!{ <option value={c.name.clone()} selected={rule.selected_cert == c.name}>{format!("{} ({})", c.name, c.source)}</option> }
-                                                                            }) }
-                                                                        </select>
-                                                                    </label>
-                                                                    <div class="field" style="grid-column: span 4;">
-                                                                        <div class="inline">
-                                                                            <span>{"ACME per host"}</span>
-                                                                            <input
-                                                                                type="checkbox"
-                                                                                checked={rule.acme_enabled}
-                                                                                onchange={{
-                                                                                    let form = form.clone();
-                                                                                    Callback::from(move |e: Event| {
-                                                                                        let mut next = (*form).clone();
-                                                                                        if let Some(r) = next.host_rules.get_mut(idx) {
-                                                                                            r.acme_enabled = checkbox_checked(&e);
-                                                                                            if r.acme_enabled {
-                                                                                                r.selected_cert.clear();
-                                                                                                r.cert_path.clear();
-                                                                                                r.key_path.clear();
-                                                                                            }
-                                                                                        }
-                                                                                        form.set(next);
-                                                                                    })
-                                                                                }}
-                                                                            />
-                                                                        </div>
-                                                                    </div>
-                                                                    <label class="field" style="grid-column: span 4;">
-                                                                        <span>{"Challenge type"}</span>
-                                                                        <select
-                                                                            disabled={!rule.acme_enabled}
-                                                                            onchange={{
-                                                                                let form = form.clone();
-                                                                                let acme_providers = acme_providers.clone();
-                                                                                Callback::from(move |e: Event| {
-                                                                                    let mut next = (*form).clone();
-                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
-                                                                                        let value = select_value(&e).unwrap_or_else(|| "http01".into());
-                                                                                        r.acme_challenge = if value == "dns01" { AcmeChallenge::Dns01 } else { AcmeChallenge::Http01 };
-                                                                                        if r.acme_challenge == AcmeChallenge::Http01 {
-                                                                                            r.acme_provider.clear();
-                                                                                        } else if r.acme_provider.is_empty() {
-                                                                                            if let Some(first) = acme_providers.get(0) {
-                                                                                                r.acme_provider = first.name.clone();
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                    form.set(next);
-                                                                                })
-                                                                            }}
-                                                                        >
-                                                                            <option value="http01" selected={rule.acme_challenge == AcmeChallenge::Http01}>{"HTTP-01"}</option>
-                                                                            <option value="dns01" selected={rule.acme_challenge == AcmeChallenge::Dns01}>{"DNS-01"}</option>
-                                                                        </select>
-                                                                    </label>
                                                                     {
-                                                                        if rule.acme_enabled && rule.acme_challenge == AcmeChallenge::Dns01 {
-                                                                            let providers = (*acme_providers).clone();
+                                                                        if rule.tls_enabled && !rule.acme_enabled {
                                                                             html!{
-                                                                                <label class="field" style="grid-column: span 4;">
-                                                                                    <span>{"DNS provider"}</span>
+                                                                                <>
+                                                                                <label class="field" style="grid-column: span 6;">
+                                                                                    <span>{"Pool"}</span>
                                                                                     <select
                                                                                         onchange={{
                                                                                             let form = form.clone();
                                                                                             Callback::from(move |e: Event| {
                                                                                                 let mut next = (*form).clone();
                                                                                                 if let Some(r) = next.host_rules.get_mut(idx) {
-                                                                                                    r.acme_provider = select_value(&e).unwrap_or_default();
+                                                                                                    r.pool = select_value(&e).unwrap_or_default();
                                                                                                 }
                                                                                                 form.set(next);
                                                                                             })
                                                                                         }}
-                                                                                        disabled={!rule.acme_enabled}
                                                                                     >
-                                                                                        { for providers.iter().map(|p| {
-                                                                                            html!{ <option value={p.name.clone()} selected={rule.acme_provider == p.name}>{format!("{} ({:?})", p.name, p.provider)}</option> }
+                                                                                        <option value="" selected={rule.pool.is_empty()}>{"Select pool (required)"}</option>
+                                                                                        { for pools.iter().map(|p| {
+                                                                                            html!{ <option value={p.name.clone()} selected={rule.pool == p.name}>{&p.name}</option> }
+                                                                                        })}
+                                                                                    </select>
+                                                                                </label>
+                                                                                <label class="field" style="grid-column: span 6;">
+                                                                                    <span>{"Dedicated certificate (optional)"}</span>
+                                                                                    <select
+                                                                                        onchange={{
+                                                                                            let form = form.clone();
+                                                                                            let certs = certs.clone();
+                                                                                            Callback::from(move |e: Event| {
+                                                                                                let mut next = (*form).clone();
+                                                                                                if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                    let name = select_value(&e).unwrap_or_default();
+                                                                                                    r.selected_cert = name.clone();
+                                                                                                    if let Some(bundle) = certs.iter().find(|c| c.name == name) {
+                                                                                                        r.cert_path = bundle.cert_path.clone();
+                                                                                                        r.key_path = bundle.key_path.clone();
+                                                                                                    } else {
+                                                                                                        r.cert_path.clear();
+                                                                                                        r.key_path.clear();
+                                                                                                    }
+                                                                                                }
+                                                                                                form.set(next);
+                                                                                            })
+                                                                                        }}
+                                                                                    >
+                                                                                        <option value="" selected={rule.selected_cert.is_empty()}>{"Use listener/default"}</option>
+                                                                                        { for certs.iter().map(|c| {
+                                                                                            html!{ <option value={c.name.clone()} selected={rule.selected_cert == c.name}>{format!("{} ({})", c.name, c.source)}</option> }
                                                                                         }) }
                                                                                     </select>
                                                                                 </label>
+                                                                                </>
+                                                                            }
+                                                                        } else {
+                                                                            html!{
+                                                                                <label class="field" style="grid-column: span 12;">
+                                                                                    <span>{"Pool"}</span>
+                                                                                    <select
+                                                                                        onchange={{
+                                                                                            let form = form.clone();
+                                                                                            Callback::from(move |e: Event| {
+                                                                                                let mut next = (*form).clone();
+                                                                                                if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                    r.pool = select_value(&e).unwrap_or_default();
+                                                                                                }
+                                                                                                form.set(next);
+                                                                                            })
+                                                                                        }}
+                                                                                    >
+                                                                                        <option value="" selected={rule.pool.is_empty()}>{"Select pool (required)"}</option>
+                                                                                        { for pools.iter().map(|p| {
+                                                                                            html!{ <option value={p.name.clone()} selected={rule.pool == p.name}>{&p.name}</option> }
+                                                                                        })}
+                                                                                    </select>
+                                                                                </label>
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    <div class="field" style="grid-column: span 4;">
+                                                                        {
+                                                                            if rule.tls_enabled {
+                                                                                html!{
+                                                                                    <div class="inline">
+                                                                                        <span>{"ACME per host"}</span>
+                                                                                        <input
+                                                                                            type="checkbox"
+                                                                                            checked={rule.acme_enabled}
+                                                                                            onchange={{
+                                                                                                let form = form.clone();
+                                                                                                Callback::from(move |e: Event| {
+                                                                                                    let mut next = (*form).clone();
+                                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                        r.acme_enabled = checkbox_checked(&e);
+                                                                                                        if r.acme_enabled {
+                                                                                                            r.selected_cert.clear();
+                                                                                                            r.cert_path.clear();
+                                                                                                            r.key_path.clear();
+                                                                                                        }
+                                                                                                    }
+                                                                                                    form.set(next);
+                                                                                                })
+                                                                                            }}
+                                                                                        />
+                                                                                    </div>
+                                                                                }
+                                                                            } else { html!{} }
+                                                                        }
+                                                                    </div>
+                                                                    {
+                                                                        if rule.tls_enabled && rule.acme_enabled {
+                                                                            html!{
+                                                                                <>
+                                                                                <label class="field" style="grid-column: span 4;">
+                                                                                    <span>{"Challenge type"}</span>
+                                                                                    <select
+                                                                                        onchange={{
+                                                                                            let form = form.clone();
+                                                                                            let acme_providers = acme_providers.clone();
+                                                                                            Callback::from(move |e: Event| {
+                                                                                                let mut next = (*form).clone();
+                                                                                                if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                    let value = select_value(&e).unwrap_or_else(|| "http01".into());
+                                                                                                    r.acme_challenge = if value == "dns01" { AcmeChallenge::Dns01 } else { AcmeChallenge::Http01 };
+                                                                                                    if r.acme_challenge == AcmeChallenge::Http01 {
+                                                                                                        r.acme_provider.clear();
+                                                                                                    } else if r.acme_provider.is_empty() {
+                                                                                                        if let Some(first) = acme_providers.get(0) {
+                                                                                                            r.acme_provider = first.name.clone();
+                                                                                                        }
+                                                                                                    }
+                                                                                                }
+                                                                                                form.set(next);
+                                                                                            })
+                                                                                        }}
+                                                                                    >
+                                                                                        <option value="http01" selected={rule.acme_challenge == AcmeChallenge::Http01}>{"HTTP-01"}</option>
+                                                                                        <option value="dns01" selected={rule.acme_challenge == AcmeChallenge::Dns01}>{"DNS-01"}</option>
+                                                                                    </select>
+                                                                                </label>
+                                                                                {
+                                                                                    if rule.acme_challenge == AcmeChallenge::Dns01 {
+                                                                                        let providers = (*acme_providers).clone();
+                                                                                        html!{
+                                                                                            <label class="field" style="grid-column: span 4;">
+                                                                                                <span>{"DNS provider"}</span>
+                                                                                                <select
+                                                                                                    onchange={{
+                                                                                                        let form = form.clone();
+                                                                                                        Callback::from(move |e: Event| {
+                                                                                                            let mut next = (*form).clone();
+                                                                                                            if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                                r.acme_provider = select_value(&e).unwrap_or_default();
+                                                                                                            }
+                                                                                                            form.set(next);
+                                                                                                        })
+                                                                                                    }}
+                                                                                                >
+                                                                                                    { for providers.iter().map(|p| {
+                                                                                                        html!{
+                                                                                                            <option value={p.name.clone()} selected={rule.acme_provider == p.name}>
+                                                                                                                { format!("{} ({:?})", p.name, p.provider) }
+                                                                                                            </option>
+                                                                                                        }
+                                                                                                    }) }
+                                                                                                </select>
+                                                                                            </label>
+                                                                                        }
+                                                                                    } else { html!{} }
+                                                                                }
+                                                                                <label class="field" style="grid-column: span 6;">
+                                                                                    <span>{"Contact email (optional)"}</span>
+                                                                                    <input
+                                                                                        value={rule.acme_email.clone()}
+                                                                                        oninput={{
+                                                                                            let form = form.clone();
+                                                                                            Callback::from(move |e: InputEvent| {
+                                                                                                let mut next = (*form).clone();
+                                                                                                if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                    r.acme_email = event_value(&e);
+                                                                                                }
+                                                                                                form.set(next);
+                                                                                            })
+                                                                                        }}
+                                                                                        placeholder="ops@example.com"
+                                                                                    />
+                                                                                </label>
+                                                                                <label class="field" style="grid-column: span 6;">
+                                                                                    <span>{"Directory URL (optional override)"}</span>
+                                                                                    <input
+                                                                                        value={rule.acme_directory.clone()}
+                                                                                        oninput={{
+                                                                                            let form = form.clone();
+                                                                                            Callback::from(move |e: InputEvent| {
+                                                                                                let mut next = (*form).clone();
+                                                                                                if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                    r.acme_directory = event_value(&e);
+                                                                                                }
+                                                                                                form.set(next);
+                                                                                            })
+                                                                                        }}
+                                                                                        placeholder="https://acme-v02.api.letsencrypt.org/directory"
+                                                                                    />
+                                                                                </label>
+                                                                                </>
                                                                             }
                                                                         } else { html!{} }
                                                                     }
-                                                                    <label class="field" style="grid-column: span 6;">
-                                                                        <span>{"Contact email (optional)"}</span>
-                                                                        <input
-                                                                            value={rule.acme_email.clone()}
-                                                                            disabled={!rule.acme_enabled}
-                                                                            oninput={{
-                                                                                let form = form.clone();
-                                                                                Callback::from(move |e: InputEvent| {
-                                                                                    let mut next = (*form).clone();
-                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
-                                                                                        r.acme_email = event_value(&e);
-                                                                                    }
-                                                                                    form.set(next);
-                                                                                })
-                                                                            }}
-                                                                            placeholder="ops@example.com"
-                                                                        />
-                                                                    </label>
-                                                                    <label class="field" style="grid-column: span 6;">
-                                                                        <span>{"Directory URL (optional override)"}</span>
-                                                                        <input
-                                                                            value={rule.acme_directory.clone()}
-                                                                            disabled={!rule.acme_enabled}
-                                                                            oninput={{
-                                                                                let form = form.clone();
-                                                                                Callback::from(move |e: InputEvent| {
-                                                                                    let mut next = (*form).clone();
-                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
-                                                                                        r.acme_directory = event_value(&e);
-                                                                                    }
-                                                                                    form.set(next);
-                                                                                })
-                                                                            }}
-                                                                            placeholder="https://acme-v02.api.letsencrypt.org/directory"
-                                                                        />
-                                                                    </label>
                                                                     <div class="route-row" style="grid-column: 1 / -1;">
                                                                         <p class="muted">{"Upstreams come from the selected pool."}</p>
                                                                     </div>
@@ -2017,25 +2150,37 @@ fn app() -> Html {
                                                         <h3>{ &p.name }</h3>
                                                         <p class="muted">{ format!("{} upstream(s)", p.upstreams.len()) }</p>
                                                     </div>
-                                                    <button class="ghost" type="button" onclick={{
-                                                        let name = p.name.clone();
-                                                        let pools = pools.clone();
-                                                        let handle_error = handle_error.clone();
-                                                        Callback::from(move |_| {
-                                                            let name = name.clone();
+                                                    <div class="pill-row">
+                                                        <button class="ghost" type="button" onclick={{
+                                                            let p = p.clone();
+                                                            let pool_form = pool_form.clone();
+                                                            Callback::from(move |_| {
+                                                                let mut next = (*pool_form).clone();
+                                                                next.name = p.name.clone();
+                                                                next.upstreams_text = p.upstreams.iter().map(|u| format!("{}={}", u.name, u.address)).collect::<Vec<_>>().join("\n");
+                                                                pool_form.set(next);
+                                                            })
+                                                        }}>{"Edit"}</button>
+                                                        <button class="ghost" type="button" onclick={{
+                                                            let name = p.name.clone();
                                                             let pools = pools.clone();
                                                             let handle_error = handle_error.clone();
-                                                            spawn_local(async move {
-                                                                match api_delete_pool(name.clone()).await {
-                                                                    Ok(_) => {
-                                                                        let filtered: Vec<_> = pools.iter().cloned().filter(|pool| pool.name != name).collect();
-                                                                        pools.set(filtered);
+                                                            Callback::from(move |_| {
+                                                                let name = name.clone();
+                                                                let pools = pools.clone();
+                                                                let handle_error = handle_error.clone();
+                                                                spawn_local(async move {
+                                                                    match api_delete_pool(name.clone()).await {
+                                                                        Ok(_) => {
+                                                                            let filtered: Vec<_> = pools.iter().cloned().filter(|pool| pool.name != name).collect();
+                                                                            pools.set(filtered);
+                                                                        }
+                                                                        Err(err) => handle_error(err),
                                                                     }
-                                                                    Err(err) => handle_error(err),
-                                                                }
-                                                            });
-                                                        })
-                                                    }}>{"Delete"}</button>
+                                                                });
+                                                            })
+                                                        }}>{"Delete"}</button>
+                                                    </div>
                                                 </div>
                                                 <div class="pill-row wrap">
                                                     { for p.upstreams.iter().map(|u| {
@@ -2256,6 +2401,13 @@ fn render_listener(
                     }
                 }
                 {
+                    if !listener.enabled {
+                        html! { <span class="pill pill-error">{"Disabled"}</span> }
+                    } else {
+                        html!{}
+                    }
+                }
+                {
                     if listener.tls.is_some() {
                         let label = listener
                             .tls
@@ -2329,6 +2481,7 @@ fn render_listener(
                                 html!{
                                     <div class="pill-row wrap">
                                         <span class="pill pill-ghost">{host_label}</span>
+                                        { if !r.enabled { html!{<span class="pill pill-error">{"Disabled"}</span>} } else { html!{} } }
                                         <span class={classes!(tls_class)}>
                                             {format!("TLS: {}", tls_label)}
                                         </span>
@@ -2377,6 +2530,7 @@ struct ListenerForm {
     name: String,
     listen: String,
     protocol: Protocol,
+    enabled: bool,
     upstreams_text: String,
     tcp_pool: String,
     host_rules: Vec<HostRuleForm>,
@@ -2451,6 +2605,7 @@ impl Default for ListenerForm {
             name: String::new(),
             listen: String::from("0.0.0.0:9000"),
             protocol: Protocol::Http,
+            enabled: true,
             upstreams_text: String::from("http://127.0.0.1:7000"),
             tcp_pool: String::new(),
             host_rules: vec![HostRuleForm::default()],
@@ -2482,6 +2637,8 @@ impl Default for HostRuleForm {
     fn default() -> Self {
         Self {
             host: String::new(),
+            enabled: true,
+            tls_enabled: true,
             upstreams_text: String::from("http://127.0.0.1:7000"),
             pool: String::new(),
             selected_cert: String::new(),
@@ -2649,51 +2806,62 @@ impl ListenerForm {
             .clone()
             .unwrap_or_default()
             .into_iter()
-            .map(|r| HostRuleForm {
-                host: r.host,
-                upstreams_text: r
-                    .upstreams
-                    .into_iter()
-                    .map(|u| format!("{}={}", u.name, u.address))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                pool: r.pool.unwrap_or_default(),
-                selected_cert: r
-                    .tls
-                    .as_ref()
-                    .map(|t| t.cert_path.rsplit('/').next().unwrap_or("").to_string())
-                    .unwrap_or_default(),
-                cert_path: r
-                    .tls
-                    .as_ref()
-                    .map(|t| t.cert_path.clone())
-                    .unwrap_or_default(),
-                key_path: r
-                    .tls
-                    .as_ref()
-                    .map(|t| t.key_path.clone())
-                    .unwrap_or_default(),
-                acme_enabled: r.acme.is_some(),
-                acme_email: r
-                    .acme
-                    .as_ref()
-                    .and_then(|a| a.email.clone())
-                    .unwrap_or_default(),
-                acme_directory: r
-                    .acme
-                    .as_ref()
-                    .and_then(|a| a.directory_url.clone())
-                    .unwrap_or_default(),
-                acme_challenge: r
-                    .acme
-                    .as_ref()
-                    .map(|a| a.challenge.clone())
-                    .unwrap_or(AcmeChallenge::Http01),
-                acme_provider: r
-                    .acme
-                    .as_ref()
-                    .and_then(|a| a.provider.clone())
-                    .unwrap_or_default(),
+            .map(|r| {
+                let mut form = HostRuleForm {
+                    host: r.host,
+                    enabled: r.enabled,
+                    tls_enabled: r.tls.is_some() || r.acme.is_some(),
+                    upstreams_text: r
+                        .upstreams
+                        .into_iter()
+                        .map(|u| format!("{}={}", u.name, u.address))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    pool: r.pool.unwrap_or_default(),
+                    selected_cert: r
+                        .tls
+                        .as_ref()
+                        .map(|t| t.cert_path.rsplit('/').next().unwrap_or("").to_string())
+                        .unwrap_or_default(),
+                    cert_path: r
+                        .tls
+                        .as_ref()
+                        .map(|t| t.cert_path.clone())
+                        .unwrap_or_default(),
+                    key_path: r
+                        .tls
+                        .as_ref()
+                        .map(|t| t.key_path.clone())
+                        .unwrap_or_default(),
+                    acme_enabled: r.acme.is_some(),
+                    acme_email: r
+                        .acme
+                        .as_ref()
+                        .and_then(|a| a.email.clone())
+                        .unwrap_or_default(),
+                    acme_directory: r
+                        .acme
+                        .as_ref()
+                        .and_then(|a| a.directory_url.clone())
+                        .unwrap_or_default(),
+                    acme_challenge: r
+                        .acme
+                        .as_ref()
+                        .map(|a| a.challenge.clone())
+                        .unwrap_or(AcmeChallenge::Http01),
+                    acme_provider: r
+                        .acme
+                        .as_ref()
+                        .and_then(|a| a.provider.clone())
+                        .unwrap_or_default(),
+                };
+                // If ACME is enabled, clear any prefilled certificate paths to avoid conflicts.
+                if form.acme_enabled {
+                    form.selected_cert.clear();
+                    form.cert_path.clear();
+                    form.key_path.clear();
+                }
+                form
             })
             .collect();
 
@@ -2715,6 +2883,7 @@ impl ListenerForm {
             acme_provider,
             sticky,
             cookie_name,
+            enabled: listener.enabled,
         }
     }
 
@@ -2741,27 +2910,31 @@ impl ListenerForm {
                     if rule.host.trim().is_empty() {
                         continue;
                     }
-                    if rule.pool.trim().is_empty() {
+                    if rule.pool.trim().is_empty() && rule.enabled {
                         return Err(format!("Host {} must select a pool", rule.host));
                     }
+                    let (mut acme_enabled, mut selected_cert, mut cert_path, mut key_path) = (
+                        rule.acme_enabled,
+                        rule.selected_cert.clone(),
+                        rule.cert_path.clone(),
+                        rule.key_path.clone(),
+                    );
+                    if !rule.tls_enabled {
+                        acme_enabled = false;
+                        selected_cert.clear();
+                        cert_path.clear();
+                        key_path.clear();
+                    }
                     let upstreams: Vec<UpstreamPayload> = Vec::new();
-                    if !rule.selected_cert.trim().is_empty()
-                        && (rule.cert_path.trim().is_empty() || rule.key_path.trim().is_empty())
+                    if !selected_cert.trim().is_empty()
+                        && (cert_path.trim().is_empty() || key_path.trim().is_empty())
                     {
                         return Err(format!(
                             "Host {} certificate paths missing after selection",
                             rule.host
                         ));
                     }
-                    if rule.acme_enabled
-                        && (!rule.cert_path.trim().is_empty() || !rule.key_path.trim().is_empty())
-                    {
-                        return Err(format!(
-                            "Host {} cannot set both ACME and a certificate",
-                            rule.host
-                        ));
-                    }
-                    if rule.acme_enabled
+                    if acme_enabled
                         && rule.acme_challenge == AcmeChallenge::Dns01
                         && rule.acme_provider.trim().is_empty()
                     {
@@ -2769,20 +2942,21 @@ impl ListenerForm {
                     }
                     routes.push(HostRulePayload {
                         host: rule.host.trim().to_lowercase(),
+                        enabled: rule.enabled,
                         upstreams,
                         pool: (!rule.pool.trim().is_empty()).then(|| rule.pool.clone()),
-                        tls: if !rule.cert_path.trim().is_empty()
-                            && !rule.key_path.trim().is_empty()
-                            && !rule.acme_enabled
+                        tls: if !cert_path.trim().is_empty()
+                            && !key_path.trim().is_empty()
+                            && !acme_enabled
                         {
                             Some(TlsConfig {
-                                cert_path: rule.cert_path.clone(),
-                                key_path: rule.key_path.clone(),
+                                cert_path,
+                                key_path,
                             })
                         } else {
                             None
                         },
-                        acme: if rule.acme_enabled {
+                        acme: if acme_enabled {
                             Some(AcmeConfig {
                                 email: (!rule.acme_email.trim().is_empty())
                                     .then(|| rule.acme_email.clone()),
@@ -2876,6 +3050,7 @@ impl ListenerForm {
             name: self.name.clone(),
             listen: self.listen.clone(),
             protocol: self.protocol.clone(),
+            enabled: self.enabled,
             upstreams,
             host_routes,
             tls,
@@ -3337,9 +3512,15 @@ async fn api_log_file(name: String) -> Result<String, String> {
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     if resp.ok() {
-        resp.text().await.map_err(|e| format!("read body failed: {e}"))
+        resp.text()
+            .await
+            .map_err(|e| format!("read body failed: {e}"))
     } else {
-        Err(format!("{}: {}", resp.status(), resp.text().await.unwrap_or_default()))
+        Err(format!(
+            "{}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ))
     }
 }
 

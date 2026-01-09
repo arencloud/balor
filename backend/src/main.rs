@@ -76,6 +76,9 @@ use x509_parser::prelude::FromDer;
 use x509_parser::prelude::X509Certificate;
 
 const BODY_LIMIT: usize = 8 * 1024 * 1024;
+fn default_enabled() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -155,6 +158,8 @@ struct ListenerConfig {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
     upstreams: Vec<Upstream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_routes: Option<Vec<HostRule>>,
@@ -171,6 +176,8 @@ struct ListenerPayload {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
     upstreams: Vec<UpstreamPayload>,
     #[serde(default)]
     host_routes: Option<Vec<HostRulePayload>>,
@@ -199,6 +206,8 @@ struct UpstreamPoolPayload {
 struct HostRulePayload {
     host: String,
     upstreams: Vec<UpstreamPayload>,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,6 +222,8 @@ struct HostRulePayload {
 struct HostRule {
     host: String,
     upstreams: Vec<Upstream>,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1348,6 +1359,7 @@ impl ListenerPayload {
             name,
             listen,
             protocol,
+            enabled,
             upstreams,
             host_routes,
             tls,
@@ -1436,6 +1448,7 @@ impl ListenerPayload {
             name,
             listen,
             protocol,
+            enabled,
             upstreams,
             host_routes,
             tls,
@@ -1466,6 +1479,7 @@ impl HostRulePayload {
         let Self {
             host,
             upstreams,
+            enabled,
             pool,
             tls,
             acme,
@@ -1489,12 +1503,13 @@ impl HostRulePayload {
                 }
             }
         }
-        if upstreams.is_empty() {
+        if upstreams.is_empty() && enabled {
             return Err("host route must include at least one upstream or pool".into());
         }
         Ok(HostRule {
             host: host.to_lowercase(),
             upstreams,
+            enabled,
             pool: pool.clone(),
             tls: tls.map(|t| t.into_config()).transpose()?,
             acme: acme.map(|a| a.into_config()).transpose()?,
@@ -1606,10 +1621,17 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
         return Ok(());
     };
 
+    if !config.enabled {
+        return Ok(());
+    }
+
     let mut changed = false;
 
     if let Some(routes) = config.host_routes.as_mut() {
         for route in routes.iter_mut() {
+            if !route.enabled {
+                continue;
+            }
             if let Some(acme) = &route.acme {
                 let needs_cert = route
                     .tls
@@ -1939,6 +1961,10 @@ impl BalancerSupervisor {
     async fn upsert(&self, config: ListenerConfig) -> anyhow::Result<()> {
         let id = config.id;
         self.remove(&config.id).await;
+        if !config.enabled {
+            info!("listener {} is disabled; runtime not started", config.name);
+            return Ok(());
+        }
         let handle = spawn_listener(config, self.health.clone(), self.metrics.clone()).await?;
         self.tasks.write().insert(id, handle);
         Ok(())
@@ -2115,10 +2141,18 @@ async fn run_http_listener(
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = config.listen.parse()?;
 
+    let active_routes: Vec<HostRule> = config
+        .host_routes
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.enabled)
+        .collect();
+
     let state = HttpProxyState::new(
         config.id,
         config.upstreams.clone(),
-        config.host_routes.clone().unwrap_or_default(),
+        active_routes.clone(),
         health,
         config.sticky.clone(),
         metrics.clone(),
@@ -2149,14 +2183,12 @@ async fn run_http_listener(
     );
 
     // Build SNI-aware rustls config from listener + host routes.
-    let tls_available = config.tls.is_some()
-        || config
-            .host_routes
-            .as_ref()
-            .map_or(false, |routes| routes.iter().any(|r| r.tls.is_some()));
+    let tls_available = config.tls.is_some() || active_routes.iter().any(|r| r.tls.is_some());
 
     if tls_available {
-        let tls_config = build_sni_rustls_config(&config).await?;
+        let mut tls_source = config.clone();
+        tls_source.host_routes = Some(active_routes.clone());
+        let tls_config = build_sni_rustls_config(&tls_source).await?;
         info!("TLS enabled for '{}' (SNI resolver active)", config.name);
         let handle = Handle::new();
         let server = axum_server::bind_rustls(listen_addr, tls_config)
@@ -2746,12 +2778,17 @@ impl ResolvesServerCert for ManualSniResolver {
 fn select_route<'a>(host: &str, routes: &'a [HostRule]) -> Option<&'a HostRule> {
     if let Some(exact) = routes
         .iter()
+        .filter(|r| r.enabled)
         .find(|r| !r.host.starts_with("*.") && r.host == host)
     {
         return Some(exact);
     }
     let mut wildcard_match: Option<&HostRule> = None;
-    for route in routes.iter().filter(|r| r.host.starts_with("*.")) {
+    for route in routes
+        .iter()
+        .filter(|r| r.enabled)
+        .filter(|r| r.host.starts_with("*."))
+    {
         let suffix = route.host.trim_start_matches("*.");
         if host.ends_with(suffix) && host.len() > suffix.len() {
             wildcard_match = match wildcard_match {
@@ -3012,6 +3049,10 @@ async fn hydrate_supervisor(state: AppState) -> anyhow::Result<()> {
 
     let mut tasks = JoinSet::new();
     for listener in listeners {
+        if !listener.enabled {
+            info!("skipping disabled listener '{}' at startup", listener.name);
+            continue;
+        }
         let sup = state.supervisor.clone();
         tasks.spawn(async move {
             if let Err(err) = sup.upsert(listener.clone()).await {
@@ -3115,9 +3156,12 @@ async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
     };
 
     for listener in listeners {
+        if !listener.enabled {
+            continue;
+        }
         let mut all_upstreams = listener.upstreams.clone();
         if let Some(routes) = &listener.host_routes {
-            for r in routes {
+            for r in routes.iter().filter(|r| r.enabled) {
                 all_upstreams.extend(r.upstreams.clone());
             }
         }
