@@ -506,6 +506,13 @@ struct LogEntry {
     listener: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct LogFileInfo {
+    name: String,
+    size: u64,
+    modified: String,
+}
+
 const LOG_DIR: &str = "data/logs";
 const LOG_BUFFER_CAP: usize = 1000;
 const LOG_RETENTION_DAYS: i64 = 14;
@@ -691,6 +698,8 @@ async fn main() -> anyhow::Result<()> {
             Router::new()
                 .route("/stats", get(stats))
                 .route("/logs", get(list_logs))
+                .route("/logs/files", get(list_log_files))
+                .route("/logs/files/:name", get(download_log_file))
                 .route("/listeners", post(create_listener).get(list_listeners))
                 .route(
                     "/listeners/:id",
@@ -786,6 +795,53 @@ async fn list_logs(
     require_admin(&ctx)?;
     let logs = LOG_BUFFER.read().iter().cloned().collect();
     Ok(Json(logs))
+}
+
+async fn list_log_files(
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<Vec<LogFileInfo>>, StatusCode> {
+    require_admin(&ctx)?;
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(LOG_DIR) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let size = meta.len();
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| chrono::DateTime::<Utc>::from(m).to_rfc3339().into())
+                    .unwrap_or_else(|| "-".into());
+                files.push(LogFileInfo {
+                    name,
+                    size,
+                    modified,
+                });
+            }
+        }
+    }
+    files.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(Json(files))
+}
+
+async fn download_log_file(
+    Path(name): Path<String>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Response, StatusCode> {
+    require_admin(&ctx)?;
+    if name.contains('/') || name.contains("..") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let path = FsPath::new(LOG_DIR).join(&name);
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let mut resp = Response::new(Body::from(data));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(resp)
 }
 
 async fn version_info() -> Json<VersionResponse> {
