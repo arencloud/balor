@@ -60,7 +60,7 @@ cargo run -p backend
 ```
 
 Environment knobs:
-- `BALOR_HTTP_ADDR` (default `0.0.0.0:8080`) – admin API + UI bind address.
+- `BALOR_HTTP_ADDR` (default `0.0.0.0:9443`) – admin API + UI bind address (port configurable; TLS for console planned).
 - `BALOR_ADMIN_DIST` (default `admin/dist`) – path where the Yew assets are served from.
 - `BALOR_STATE_FILE` (default `data/balor_state.json`) – persisted listener config storage.
 - `BALOR_DEFAULT_ADMIN_PASSWORD` (default `admin`) – bootstrap password for the auto-created `admin` user if no users exist.

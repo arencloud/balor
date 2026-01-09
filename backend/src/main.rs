@@ -321,6 +321,8 @@ fn default_cert_source() -> String {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ConfigStore {
+    #[serde(default)]
+    admin_console: Option<AdminConsoleConfig>,
     listeners: HashMap<Uuid, ListenerConfig>,
     #[serde(default)]
     users: HashMap<Uuid, UserRecord>,
@@ -368,6 +370,18 @@ struct Metrics {
     http_requests: IntCounterVec,
     http_latency: HistogramVec,
     tcp_connections: IntCounterVec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdminConsoleConfig {
+    #[serde(default = "default_admin_bind")]
+    bind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<TlsConfig>,
+}
+
+fn default_admin_bind() -> String {
+    "0.0.0.0:9443".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -708,6 +722,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(
             Router::new()
                 .route("/stats", get(stats))
+                .route("/admin/console", get(get_console_settings).put(update_console_settings))
                 .route("/logs", get(list_logs))
                 .route("/logs/files", get(list_log_files))
                 .route("/logs/files/:name", get(download_log_file))
@@ -759,18 +774,26 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    let addr: SocketAddr = std::env::var("BALOR_HTTP_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
-        .parse()?;
-    info!("Admin API listening on http://{}", addr);
+    let console_cfg = current_console_config(&state);
+    let addr: SocketAddr = console_cfg.bind.parse()?;
+    info!("Admin API listening on {}", addr);
     info!("Serving admin UI assets from {}", admin_dist.display());
 
-    let listener = TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    // If a console TLS config is stored, serve HTTPS; otherwise plain HTTP.
+    if let Some(console_tls) = console_cfg.tls {
+        info!("Admin console TLS enabled");
+        let tls = load_rustls_config(&console_tls.cert_path, &console_tls.key_path).await?;
+        axum_server::bind_rustls(addr, tls)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await?;
+    } else {
+        let listener = TcpListener::bind(addr).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -789,6 +812,52 @@ async fn metrics_handler(State(state): State<AppState>) -> Response<Body> {
             .unwrap_or_else(|_| header::HeaderValue::from_static("text/plain")),
     );
     response
+}
+
+async fn get_console_settings(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<AdminConsoleConfig>, StatusCode> {
+    require_admin(&ctx)?;
+    Ok(Json(current_console_config(&state)))
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsolePayload {
+    bind: String,
+    #[serde(default)]
+    tls: Option<TlsPayload>,
+}
+
+async fn update_console_settings(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<ConsolePayload>,
+) -> Result<Json<AdminConsoleConfig>, ApiError> {
+    require_admin(&ctx).map_err(ApiError::Forbidden)?;
+    let bind = payload.bind.trim();
+    if bind.is_empty() {
+        return Err(ApiError::BadRequest("bind address is required".into()));
+    }
+    bind.parse::<SocketAddr>()
+        .map_err(|_| ApiError::BadRequest("invalid bind address".into()))?;
+
+    let tls_cfg = match payload.tls {
+        Some(tls) => Some(tls.into_config()?),
+        None => None,
+    };
+
+    let next = AdminConsoleConfig {
+        bind: bind.to_string(),
+        tls: tls_cfg,
+    };
+
+    {
+        let mut store = state.store.write();
+        store.admin_console = Some(next.clone());
+    }
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
+    Ok(Json(next))
 }
 
 async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
@@ -2972,6 +3041,17 @@ fn resolve_state_path() -> PathBuf {
     std::env::var("BALOR_STATE_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("data/balor_state.json"))
+}
+
+fn current_console_config(state: &AppState) -> AdminConsoleConfig {
+    let store = state.store.read();
+    store
+        .admin_console
+        .clone()
+        .unwrap_or_else(|| AdminConsoleConfig {
+            bind: std::env::var("BALOR_HTTP_ADDR").unwrap_or_else(|_| default_admin_bind()),
+            tls: None,
+        })
 }
 
 fn load_store(path: &PathBuf) -> Option<ConfigStore> {
