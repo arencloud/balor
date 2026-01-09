@@ -308,6 +308,7 @@ fn app() -> Html {
     let stats = use_state(Stats::default);
     let metrics_text = use_state(|| String::new());
     let metrics_rows = use_state(Vec::<MetricRow>::new);
+    let latency_rows = use_state(Vec::<LatencyRow>::new);
     let session = use_state(load_session);
     let tab = use_state(|| Tab::Listeners);
     let users = use_state(Vec::<User>::new);
@@ -349,9 +350,11 @@ fn app() -> Html {
         let pools_state = pools.clone();
         let handle_error_pools = handle_error.clone();
         let version_state = version_info.clone();
+        let latency_rows_tab = latency_rows.clone();
         use_effect_with((*tab).clone(), move |current_tab: &Tab| {
             let metrics_text = metrics_text.clone();
             let metrics_rows = metrics_rows.clone();
+            let latency_rows = latency_rows_tab.clone();
             let session = session.clone();
             let acme_providers = acme_providers_state.clone();
             let handle_error_acme = handle_error_acme.clone();
@@ -368,6 +371,7 @@ fn app() -> Html {
                     match api_metrics().await {
                         Ok(body) => {
                             metrics_rows.set(parse_metrics_summary(&body));
+                            latency_rows.set(parse_latency_summary(&body));
                             metrics_text.set(body);
                         }
                         Err(err) => handle_error(err),
@@ -421,6 +425,9 @@ fn app() -> Html {
         let certs = certs.clone();
         let pools = pools.clone();
         let version_state = version_info.clone();
+        let latency_rows_state = latency_rows.clone();
+        let metrics_rows_state = metrics_rows.clone();
+        let metrics_text_state = metrics_text.clone();
         let handle_error = handle_error.clone();
         let status = status.clone();
         use_effect_with((*session).clone(), move |current: &Option<Session>| {
@@ -437,6 +444,11 @@ fn app() -> Html {
                     match api_stats().await {
                         Ok(s) => stats.set(s),
                         Err(err) => handle_error(err),
+                    }
+                    if let Ok(body) = api_metrics().await {
+                        metrics_rows_state.set(parse_metrics_summary(&body));
+                        latency_rows_state.set(parse_latency_summary(&body));
+                        metrics_text_state.set(body);
                     }
                     if session.role == Role::Admin {
                         if let Ok(u) = api_users().await {
@@ -1308,6 +1320,45 @@ fn app() -> Html {
                                         }
                                     } else {
                                         html!{<p class="muted">{"Waiting for metrics scrape..."}</p>}
+                                    }
+                                }
+
+                                <div class="panel-head" style="margin-top:24px;">
+                                    <div>
+                                        <p class="eyebrow">{"Latency (histogram buckets)"}</p>
+                                        <h3>{"P50 / P95 / P99 by listener"}</h3>
+                                        <p class="muted">{"Approximate quantiles derived from Prometheus buckets."}</p>
+                                    </div>
+                                </div>
+                                {
+                                    if !latency_rows.is_empty() {
+                                        html!{
+                                            <div class="cards">
+                                                { for latency_rows.iter().map(|row| {
+                                                    html!{
+                                                        <article class="card">
+                                                            <div class="card-head">
+                                                                <div>
+                                                                    <p class="eyebrow">{"Listener"}</p>
+                                                                    <h3 class="mono">{ &row.listener }</h3>
+                                                                    <p class="muted">{format!("{:.0} samples", row.count)}</p>
+                                                                </div>
+                                                            </div>
+                                                            <div class="pill-row wrap">
+                                                                <span class="pill pill-ghost">{format!("p50 ≈ {:.3}s", row.p50)}</span>
+                                                                <span class="pill pill-ghost">{format!("p95 ≈ {:.3}s", row.p95)}</span>
+                                                                <span class="pill pill-ghost">{format!("p99 ≈ {:.3}s", row.p99)}</span>
+                                                            </div>
+                                                            <div class="bar">
+                                                                <div class="fill" style={format!("width:{:.1}%;", (row.p95 / row.p99.max(0.001) * 100.0).min(100.0))}></div>
+                                                            </div>
+                                                        </article>
+                                                    }
+                                                }) }
+                                            </div>
+                                        }
+                                    } else {
+                                        html!{<p class="muted">{"Latency data not yet available."}</p>}
                                     }
                                 }
                             </section>
@@ -2787,6 +2838,15 @@ struct VersionInfo {
     build: String,
 }
 
+#[derive(Clone, PartialEq)]
+struct LatencyRow {
+    listener: String,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    count: f64,
+}
+
 fn parse_metrics_summary(body: &str) -> Vec<MetricRow> {
     let mut rows = Vec::new();
     for line in body.lines() {
@@ -2828,6 +2888,71 @@ fn parse_metrics_summary(body: &str) -> Vec<MetricRow> {
         });
     }
     rows
+}
+
+fn parse_latency_summary(body: &str) -> Vec<LatencyRow> {
+    use std::collections::HashMap;
+    let mut buckets: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+
+    for line in body.lines() {
+        let line = line.trim();
+        if !line.starts_with("balor_http_request_duration_seconds_bucket") {
+            continue;
+        }
+        let parts: Vec<_> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let labels = parts[0];
+        let value: f64 = parts[1].parse().unwrap_or(0.0);
+        let mut listener = "unknown".to_string();
+        let mut le = f64::INFINITY;
+        if let Some(start) = labels.find('{') {
+            let inner = &labels[start + 1..labels.len().saturating_sub(1)];
+            for pair in inner.split(',') {
+                let mut kv = pair.splitn(2, '=');
+                if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                    let v = v.trim_matches('"');
+                    match k {
+                        "listener_id" => listener = v.to_string(),
+                        "le" => le = v.parse().unwrap_or(f64::INFINITY),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        buckets.entry(listener).or_default().push((le, value));
+    }
+
+    let quant = |data: &[(f64, f64)], q: f64| -> f64 {
+        let mut sorted = data.to_vec();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let total = sorted.last().map(|(_, v)| *v).unwrap_or(0.0);
+        if total <= 0.0 {
+            return 0.0;
+        }
+        let target = total * q;
+        for (le, count) in sorted {
+            if count >= target {
+                return le;
+            }
+        }
+        0.0
+    };
+
+    buckets
+        .into_iter()
+        .map(|(listener, data)| {
+            let count = data.iter().map(|(_, v)| *v).fold(0.0, f64::max); // cumulative buckets; take max as total
+            LatencyRow {
+                listener,
+                p50: quant(&data, 0.50),
+                p95: quant(&data, 0.95),
+                p99: quant(&data, 0.99),
+                count,
+            }
+        })
+        .collect()
 }
 
 fn with_auth(req: gloo_net::http::RequestBuilder) -> gloo_net::http::RequestBuilder {
