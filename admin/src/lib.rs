@@ -1474,6 +1474,11 @@ fn app() -> Html {
                                                     </div>
                                                     <div class="pill-row">
                                                         <button class="ghost" type="button" onclick={Callback::from(move |_| {
+                                                            if let Some(win) = web_sys::window() {
+                                                                let _ = win.open_with_url_and_target(&format!("/api/logs/files/{}", name), "_blank");
+                                                            }
+                                                        })}>{"Download"}</button>
+                                                        <button class="ghost" type="button" onclick={Callback::from(move |_| {
                                                             let name = name.clone();
                                                             let log_file_view = log_file_view.clone();
                                                             let handle_error = handle_error.clone();
