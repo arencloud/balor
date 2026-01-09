@@ -722,7 +722,10 @@ async fn main() -> anyhow::Result<()> {
         .merge(
             Router::new()
                 .route("/stats", get(stats))
-                .route("/admin/console", get(get_console_settings).put(update_console_settings))
+                .route(
+                    "/admin/console",
+                    get(get_console_settings).put(update_console_settings),
+                )
                 .route("/logs", get(list_logs))
                 .route("/logs/files", get(list_log_files))
                 .route("/logs/files/:name", get(download_log_file))

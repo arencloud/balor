@@ -165,6 +165,18 @@ struct CertificatePayload {
     source: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+struct AdminConsoleConfig {
+    #[serde(default = "default_admin_bind")]
+    bind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<TlsConfig>,
+}
+
+fn default_admin_bind() -> String {
+    "0.0.0.0:9443".to_string()
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct Upstream {
     id: Uuid,
@@ -334,6 +346,8 @@ fn app() -> Html {
     let certs = use_state(Vec::<CertificateBundle>::new);
     let cert_form = use_state(CertificateForm::default);
     let cert_status = use_state(StatusLine::default);
+    let console_cfg = use_state(AdminConsoleConfig::default);
+    let console_status = use_state(StatusLine::default);
     let pools = use_state(Vec::<UpstreamPool>::new);
     let pool_form = use_state(UpstreamPoolForm::default);
     let pool_status = use_state(StatusLine::default);
@@ -370,6 +384,8 @@ fn app() -> Html {
         let pools_state = pools.clone();
         let handle_error_pools = handle_error.clone();
         let version_state = version_info.clone();
+        let console_cfg_state = console_cfg.clone();
+        let console_status_state = console_status.clone();
         let logs_state = logs.clone();
         let log_files_state = log_files.clone();
         let latency_rows_tab = latency_rows.clone();
@@ -385,6 +401,8 @@ fn app() -> Html {
             let pools_state = pools_state.clone();
             let handle_error_pools = handle_error_pools.clone();
             let version_state = version_state.clone();
+            let console_cfg_state = console_cfg_state.clone();
+            let console_status_state = console_status_state.clone();
             if *current_tab == Tab::Metrics {
                 spawn_local(async move {
                     if session.is_none() {
@@ -430,6 +448,13 @@ fn app() -> Html {
                     match api_version().await {
                         Ok(ver) => version_state.set(Some(ver)),
                         Err(err) => handle_error(err),
+                    }
+                });
+            } else if *current_tab == Tab::Listeners {
+                spawn_local(async move {
+                    if let Ok(console) = api_console().await {
+                        console_cfg_state.set(console);
+                        console_status_state.set(StatusLine::clear());
                     }
                 });
             } else if *current_tab == Tab::Logs {
@@ -889,6 +914,119 @@ fn app() -> Html {
                     match *tab {
                         Tab::Listeners => html!{
                             <>
+                            <section class="panel">
+                                <div class="panel-head">
+                                    <div>
+                                        <p class="eyebrow">{"Console"}</p>
+                                        <h2>{"Admin Console Settings"}</h2>
+                                        <p class="muted">{"Port and TLS for the Balor control plane. Requires admin role."}</p>
+                                    </div>
+                                    <StatusBadge status={(*console_status).clone()} />
+                                </div>
+                                <div class="form-grid">
+                                    <label class="field">
+                                        <span>{"Bind address (host:port)"}</span>
+                                        <input
+                                            value={console_cfg.bind.clone()}
+                                            oninput={{
+                                                let console_cfg = console_cfg.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*console_cfg).clone();
+                                                    next.bind = event_value(&e);
+                                                    console_cfg.set(next);
+                                                })
+                                            }}
+                                            placeholder="0.0.0.0:9443"
+                                        />
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Console TLS"}</span>
+                                        <div class="inline">
+                                            <input
+                                                type="checkbox"
+                                                checked={console_cfg.tls.is_some()}
+                                                onchange={{
+                                                    let console_cfg = console_cfg.clone();
+                                                    Callback::from(move |e: Event| {
+                                                        let mut next = (*console_cfg).clone();
+                                                        if checkbox_checked(&e) {
+                                                            if next.tls.is_none() {
+                                                                next.tls = Some(TlsConfig{ cert_path: String::new(), key_path: String::new() });
+                                                            }
+                                                        } else {
+                                                            next.tls = None;
+                                                        }
+                                                        console_cfg.set(next);
+                                                    })
+                                                }}
+                                            />
+                                            <span class="muted">{ if console_cfg.tls.is_some() { "TLS enabled" } else { "TLS disabled" } }</span>
+                                        </div>
+                                    </label>
+                                    {
+                                        if let Some(tls) = console_cfg.tls.clone() {
+                                            html!{
+                                                <>
+                                                <label class="field">
+                                                    <span>{"Certificate"}</span>
+                                                    <select
+                                                        onchange={{
+                                                            let console_cfg = console_cfg.clone();
+                                                            let certs = certs.clone();
+                                                            Callback::from(move |e: Event| {
+                                                                let mut next = (*console_cfg).clone();
+                                                                let name = select_value(&e).unwrap_or_default();
+                                                                if let Some(bundle) = certs.iter().find(|c| c.name == name) {
+                                                                    if let Some(ref mut cfg) = next.tls {
+                                                                        cfg.cert_path = bundle.cert_path.clone();
+                                                                        cfg.key_path = bundle.key_path.clone();
+                                                                    }
+                                                                }
+                                                                console_cfg.set(next);
+                                                            })
+                                                        }}
+                                                    >
+                                                        <option value="">{"Select certificate"}</option>
+                                                        { for certs.iter().map(|c| {
+                                                            let selected = match console_cfg.tls.as_ref() {
+                                                                Some(t) => t.cert_path == c.cert_path,
+                                                                None => false
+                                                            };
+                                                            html!{ <option value={c.name.clone()} selected={selected}>{format!("{} ({})", c.name, c.source)}</option> }
+                                                        })}
+                                                    </select>
+                                                </label>
+                                                <div class="pill-row">
+                                                    <span class="pill pill-ghost mono">{tls.cert_path}</span>
+                                                </div>
+                                                </>
+                                            }
+                                        } else { html!{} }
+                                    }
+                                </div>
+                                <div class="actions">
+                                    <button type="button" class="primary" onclick={{
+                                        let console_cfg = console_cfg.clone();
+                                        let console_status = console_status.clone();
+                                        let handle_error = handle_error.clone();
+                                        Callback::from(move |_| {
+                                            let payload = (*console_cfg).clone();
+                                            let console_status = console_status.clone();
+                                            let handle_error = handle_error.clone();
+                                            spawn_local(async move {
+                                                match api_save_console(payload).await {
+                                                    Ok(updated) => {
+                                                        console_status.set(StatusLine::success("Console settings saved. Restart required."));
+                                                        console_cfg.set(updated);
+                                                    }
+                                                    Err(err) => handle_error(err),
+                                                }
+                                            });
+                                        })
+                                    }}>{"Save console settings"}</button>
+                                    <StatusBadge status={(*console_status).clone()} />
+                                </div>
+                            </section>
                             <section class="panel">
                                 <div class="panel-head">
                                     <div>
@@ -3495,6 +3633,25 @@ async fn api_logs() -> Result<Vec<LogEntry>, String> {
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     parse_json_response::<Vec<LogEntry>>(resp).await
+}
+
+async fn api_console() -> Result<AdminConsoleConfig, String> {
+    let resp = with_auth(Request::get("/api/admin/console"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<AdminConsoleConfig>(resp).await
+}
+
+async fn api_save_console(payload: AdminConsoleConfig) -> Result<AdminConsoleConfig, String> {
+    let body = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    let resp = with_auth(Request::put("/api/admin/console"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<AdminConsoleConfig>(resp).await
 }
 
 async fn api_log_files() -> Result<Vec<LogFileInfo>, String> {
