@@ -743,6 +743,7 @@ async fn main() -> anyhow::Result<()> {
                     get(list_acme_providers).post(upsert_acme_provider),
                 )
                 .route("/acme/providers/:name", delete(delete_acme_provider))
+                .route("/acme/renew/:id", post(renew_acme_listener))
                 .route("/pools", get(list_pools).post(upsert_pool))
                 .route("/pools/:name", delete(delete_pool))
                 .route("/certs", get(list_certs).post(upload_cert))
@@ -837,7 +838,7 @@ async fn update_console_settings(
     Extension(ctx): Extension<AuthContext>,
     Json(payload): Json<ConsolePayload>,
 ) -> Result<Json<AdminConsoleConfig>, ApiError> {
-    require_admin(&ctx).map_err(ApiError::Forbidden)?;
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
     let bind = payload.bind.trim();
     if bind.is_empty() {
         return Err(ApiError::BadRequest("bind address is required".into()));
@@ -846,7 +847,7 @@ async fn update_console_settings(
         .map_err(|_| ApiError::BadRequest("invalid bind address".into()))?;
 
     let tls_cfg = match payload.tls {
-        Some(tls) => Some(tls.into_config()?),
+        Some(tls) => Some(tls.into_config().map_err(ApiError::BadRequest)?),
         None => None,
     };
 
@@ -861,6 +862,18 @@ async fn update_console_settings(
     }
     persist_store(&state).map_err(|_| ApiError::Internal)?;
     Ok(Json(next))
+}
+
+async fn renew_acme_listener(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&ctx)?;
+    ensure_acme_for_listener(state.clone(), id)
+        .await
+        .map_err(|e| ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
