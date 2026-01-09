@@ -326,6 +326,10 @@ fn app() -> Html {
     let version_info = use_state(|| None::<VersionInfo>);
     let logs = use_state(Vec::<LogEntry>::new);
     let log_filter = use_state(|| "all".to_string());
+    let log_files = use_state(Vec::<LogFileInfo>::new);
+    let log_file_view = use_state(|| None::<(String, String)>);
+    let log_files = use_state(Vec::<LogFileInfo>::new);
+    let log_file_view = use_state(|| None::<(String, String)>);
 
     let handle_error = {
         let status = status.clone();
@@ -353,6 +357,7 @@ fn app() -> Html {
         let handle_error_pools = handle_error.clone();
         let version_state = version_info.clone();
         let logs_state = logs.clone();
+        let log_files_state = log_files.clone();
         let latency_rows_tab = latency_rows.clone();
         use_effect_with((*tab).clone(), move |current_tab: &Tab| {
             let metrics_text = metrics_text.clone();
@@ -419,6 +424,10 @@ fn app() -> Html {
                         Ok(entries) => logs_state.set(entries),
                         Err(err) => handle_error(err),
                     }
+                    match api_log_files().await {
+                        Ok(files) => log_files_state.set(files),
+                        Err(err) => handle_error(err),
+                    }
                 });
             }
             || ()
@@ -438,6 +447,8 @@ fn app() -> Html {
         let latency_rows_state = latency_rows.clone();
         let metrics_rows_state = metrics_rows.clone();
         let metrics_text_state = metrics_text.clone();
+        let log_files_state = log_files.clone();
+        let logs_state = logs.clone();
         let handle_error = handle_error.clone();
         let status = status.clone();
         use_effect_with((*session).clone(), move |current: &Option<Session>| {
@@ -459,6 +470,12 @@ fn app() -> Html {
                         metrics_rows_state.set(parse_metrics_summary(&body));
                         latency_rows_state.set(parse_latency_summary(&body));
                         metrics_text_state.set(body);
+                    }
+                    if let Ok(files) = api_log_files().await {
+                        log_files_state.set(files);
+                    }
+                    if let Ok(entries) = api_logs().await {
+                        logs_state.set(entries);
                     }
                     if session.role == Role::Admin {
                         if let Ok(u) = api_users().await {
@@ -1394,18 +1411,24 @@ fn app() -> Html {
                                     <div>
                                         <p class="eyebrow">{"Logs"}</p>
                                         <h2>{"Recent server logs"}</h2>
-                                        <p class="muted">{"Filtered log feed (sampled placeholder until structured logs are wired)."}</p>
+                                        <p class="muted">{"Filtered log feed with optional file download."}</p>
                                     </div>
                                     <div class="pill-row">
                                         <button type="button" class="ghost" onclick={{
                                             let logs = logs.clone();
+                                            let log_files = log_files.clone();
                                             let handle_error = handle_error.clone();
                                             Callback::from(move |_| {
                                                 let logs = logs.clone();
+                                                let log_files = log_files.clone();
                                                 let handle_error = handle_error.clone();
                                                 spawn_local(async move {
                                                     match api_logs().await {
                                                         Ok(entries) => logs.set(entries),
+                                                        Err(err) => handle_error(err),
+                                                    }
+                                                    match api_log_files().await {
+                                                        Ok(files) => log_files.set(files),
                                                         Err(err) => handle_error(err),
                                                     }
                                                 });
@@ -1428,6 +1451,70 @@ fn app() -> Html {
                                 </div>
                                 <div class="log-list">
                                     { render_logs(&logs, log_filter.as_str()) }
+                                </div>
+                                <div class="panel-head" style="margin-top:24px;">
+                                    <div>
+                                        <p class="eyebrow">{"Log files"}</p>
+                                        <h3>{"Download JSONL"}</h3>
+                                        <p class="muted">{"Recent rotated files (14-day retention)."}</p>
+                                    </div>
+                                </div>
+                                <div class="cards">
+                                    { for log_files.iter().map(|f| {
+                                        let log_file_view = log_file_view.clone();
+                                        let handle_error = handle_error.clone();
+                                        let name = f.name.clone();
+                                        html!{
+                                            <article class="card">
+                                                <div class="card-head">
+                                                    <div>
+                                                        <p class="eyebrow">{"File"}</p>
+                                                        <h3 class="mono">{ &f.name }</h3>
+                                                        <p class="muted">{format!("{} bytes • {}", f.size, f.modified)}</p>
+                                                    </div>
+                                                    <div class="pill-row">
+                                                        <button class="ghost" type="button" onclick={Callback::from(move |_| {
+                                                            let name = name.clone();
+                                                            let log_file_view = log_file_view.clone();
+                                                            let handle_error = handle_error.clone();
+                                                            spawn_local(async move {
+                                                                match api_log_file(name.clone()).await {
+                                                                    Ok(body) => log_file_view.set(Some((name.clone(), body))),
+                                                                    Err(err) => handle_error(err),
+                                                                }
+                                                            });
+                                                        })}>{"View"}</button>
+                                                    </div>
+                                                </div>
+                                            </article>
+                                        }
+                                    }) }
+                                    { if log_files.is_empty() { html!{<p class="muted">{"No log files yet."}</p>} } else { html!{} } }
+                                </div>
+                                <div class="log-file-view">
+                                    {
+                                        if let Some((name, body)) = (*log_file_view).clone() {
+                                            let preview: String = body
+                                                .lines()
+                                                .take(200)
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+                                            html!{
+                                                <div class="card">
+                                                    <div class="card-head">
+                                                        <div>
+                                                            <p class="eyebrow">{"Preview"}</p>
+                                                            <h3 class="mono">{name}</h3>
+                                                            <p class="muted">{"Showing first ~200 lines"}</p>
+                                                        </div>
+                                                    </div>
+                                                    <pre class="log-pre">{preview}</pre>
+                                                </div>
+                                            }
+                                        } else {
+                                            html!{}
+                                        }
+                                    }
                                 </div>
                             </section>
                         },
@@ -2925,6 +3012,13 @@ struct LogEntry {
     listener: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct LogFileInfo {
+    name: String,
+    size: u64,
+    modified: String,
+}
+
 fn parse_metrics_summary(body: &str) -> Vec<MetricRow> {
     let mut rows = Vec::new();
     for line in body.lines() {
@@ -3220,6 +3314,27 @@ async fn api_logs() -> Result<Vec<LogEntry>, String> {
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     parse_json_response::<Vec<LogEntry>>(resp).await
+}
+
+async fn api_log_files() -> Result<Vec<LogFileInfo>, String> {
+    let resp = with_auth(Request::get("/api/logs/files"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<Vec<LogFileInfo>>(resp).await
+}
+
+async fn api_log_file(name: String) -> Result<String, String> {
+    let url = format!("/api/logs/files/{name}");
+    let resp = with_auth(Request::get(&url))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        resp.text().await.map_err(|e| format!("read body failed: {e}"))
+    } else {
+        Err(format!("{}: {}", resp.status(), resp.text().await.unwrap_or_default()))
+    }
 }
 
 async fn api_upsert_acme_provider(
