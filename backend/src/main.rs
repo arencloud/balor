@@ -488,6 +488,17 @@ struct VersionResponse {
     build: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct LogEntry {
+    timestamp: String,
+    level: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listener: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct LogoutPayload {
     token: String,
@@ -572,6 +583,7 @@ async fn main() -> anyhow::Result<()> {
     let api = Router::new()
         .route("/health", get(health))
         .route("/version", get(version_info))
+        .route("/logs", get(list_logs))
         .route("/login", post(login))
         .route("/logout", post(logout))
         .merge(
@@ -675,6 +687,11 @@ async fn version_info() -> Json<VersionResponse> {
         ui_version,
         build,
     })
+}
+
+async fn list_logs() -> Json<Vec<LogEntry>> {
+    // Placeholder: surface empty log list until structured logging buffer is wired.
+    Json(Vec::new())
 }
 
 async fn list_users(

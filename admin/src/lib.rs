@@ -324,6 +324,8 @@ fn app() -> Html {
     let pool_form = use_state(UpstreamPoolForm::default);
     let pool_status = use_state(StatusLine::default);
     let version_info = use_state(|| None::<VersionInfo>);
+    let logs = use_state(Vec::<LogEntry>::new);
+    let log_filter = use_state(|| "all".to_string());
 
     let handle_error = {
         let status = status.clone();
@@ -350,6 +352,7 @@ fn app() -> Html {
         let pools_state = pools.clone();
         let handle_error_pools = handle_error.clone();
         let version_state = version_info.clone();
+        let logs_state = logs.clone();
         let latency_rows_tab = latency_rows.clone();
         use_effect_with((*tab).clone(), move |current_tab: &Tab| {
             let metrics_text = metrics_text.clone();
@@ -407,6 +410,13 @@ fn app() -> Html {
                 spawn_local(async move {
                     match api_version().await {
                         Ok(ver) => version_state.set(Some(ver)),
+                        Err(err) => handle_error(err),
+                    }
+                });
+            } else if *current_tab == Tab::Logs {
+                spawn_local(async move {
+                    match api_logs().await {
+                        Ok(entries) => logs_state.set(entries),
                         Err(err) => handle_error(err),
                     }
                 });
@@ -757,6 +767,15 @@ fn app() -> Html {
                                 let tab = tab.clone();
                                 html!{
                                     <>
+                                        <button
+                                            type="button"
+                                            class={classes!("ghost", if *tab == Tab::Logs { "pill-on" } else { "" })}
+                                            onclick={{
+                                                let tab = tab.clone();
+                                                Callback::from(move |_| tab.set(Tab::Logs))
+                                            }}
+                                            aria-label="Logs"
+                                        >{"Logs"}</button>
                                         <button
                                             type="button"
                                             class={classes!("ghost", if *tab == Tab::Users { "pill-on" } else { "" })}
@@ -1361,6 +1380,35 @@ fn app() -> Html {
                                         html!{<p class="muted">{"Latency data not yet available."}</p>}
                                     }
                                 }
+                            </section>
+                        },
+                        Tab::Logs => html!{
+                            <section class="panel">
+                                <div class="panel-head">
+                                    <div>
+                                        <p class="eyebrow">{"Logs"}</p>
+                                        <h2>{"Recent server logs"}</h2>
+                                        <p class="muted">{"Filtered log feed (sampled placeholder until structured logs are wired)."}</p>
+                                    </div>
+                                    <div class="pill-row">
+                                        <select onchange={{
+                                            let log_filter = log_filter.clone();
+                                            Callback::from(move |e: Event| {
+                                                if let Some(val) = select_value(&e) {
+                                                    log_filter.set(val);
+                                                }
+                                            })
+                                        }}>
+                                            <option value="all" selected={log_filter.as_str() == "all"}>{"All"}</option>
+                                            <option value="info" selected={log_filter.as_str() == "info"}>{"Info"}</option>
+                                            <option value="warn" selected={log_filter.as_str() == "warn"}>{"Warn"}</option>
+                                            <option value="error" selected={log_filter.as_str() == "error"}>{"Error"}</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="log-list">
+                                    { render_logs(&logs, log_filter.as_str()) }
+                                </div>
                             </section>
                         },
                         Tab::Acme => html!{
@@ -2236,6 +2284,7 @@ struct ListenerForm {
 #[derive(Clone, PartialEq, Debug)]
 enum Tab {
     Listeners,
+    Logs,
     Users,
     Metrics,
     Acme,
@@ -2847,6 +2896,15 @@ struct LatencyRow {
     count: f64,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct LogEntry {
+    timestamp: String,
+    level: String,
+    message: String,
+    target: Option<String>,
+    listener: Option<String>,
+}
+
 fn parse_metrics_summary(body: &str) -> Vec<MetricRow> {
     let mut rows = Vec::new();
     for line in body.lines() {
@@ -2953,6 +3011,36 @@ fn parse_latency_summary(body: &str) -> Vec<LatencyRow> {
             }
         })
         .collect()
+}
+
+fn render_logs(logs: &UseStateHandle<Vec<LogEntry>>, filter: &str) -> Html {
+    let entries: Vec<_> = logs
+        .iter()
+        .filter(|l| filter == "all" || l.level.to_lowercase().starts_with(filter))
+        .collect();
+    if entries.is_empty() {
+        html! { <p class="muted">{"No logs yet."}</p> }
+    } else {
+        html! {
+            <ul>
+                { for entries.iter().map(|l| {
+                    html!{
+                        <li class="log-line">
+                            <span class={classes!("pill", match l.level.to_lowercase().as_str() {
+                                "error" => "pill-error",
+                                "warn" => "pill-on",
+                                _ => "pill-ghost",
+                            })}>{&l.level}</span>
+                            <span class="mono muted">{&l.timestamp}</span>
+                            { if let Some(t) = &l.target { html!{<span class="pill pill-ghost">{t}</span>} } else { html!{} } }
+                            { if let Some(listener) = &l.listener { html!{<span class="pill pill-ghost">{listener}</span>} } else { html!{} } }
+                            <span>{&l.message}</span>
+                        </li>
+                    }
+                }) }
+            </ul>
+        }
+    }
 }
 
 fn with_auth(req: gloo_net::http::RequestBuilder) -> gloo_net::http::RequestBuilder {
@@ -3104,6 +3192,14 @@ async fn api_acme_providers() -> Result<Vec<AcmeProviderConfig>, String> {
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     parse_json_response::<Vec<AcmeProviderConfig>>(resp).await
+}
+
+async fn api_logs() -> Result<Vec<LogEntry>, String> {
+    let resp = with_auth(Request::get("/api/logs"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<Vec<LogEntry>>(resp).await
 }
 
 async fn api_upsert_acme_provider(
