@@ -490,6 +490,7 @@ fn app() -> Html {
         let listeners = listeners.clone();
         let stats = stats.clone();
         let users = users.clone();
+        let logs_state = logs.clone();
         let handle_error = handle_error.clone();
         use_effect_with((*session).clone(), move |current: &Option<Session>| {
             let current = current.clone();
@@ -497,12 +498,14 @@ fn app() -> Html {
                 let listeners = listeners.clone();
                 let stats = stats.clone();
                 let users = users.clone();
+                let logs_state = logs_state.clone();
                 let handle_error = handle_error.clone();
                 let session_clone = Some(sess.clone());
                 Interval::new(5000, move || {
                     let listeners = listeners.clone();
                     let stats = stats.clone();
                     let users = users.clone();
+                    let logs_state = logs_state.clone();
                     let handle_error = handle_error.clone();
                     let session_clone = session_clone.clone();
                     spawn_local(async move {
@@ -518,6 +521,9 @@ fn app() -> Html {
                             if session.role == Role::Admin {
                                 if let Ok(u) = api_users().await {
                                     users.set(u);
+                                }
+                                if let Ok(l) = api_logs().await {
+                                    logs_state.set(l);
                                 }
                             }
                         }
@@ -1391,6 +1397,20 @@ fn app() -> Html {
                                         <p class="muted">{"Filtered log feed (sampled placeholder until structured logs are wired)."}</p>
                                     </div>
                                     <div class="pill-row">
+                                        <button type="button" class="ghost" onclick={{
+                                            let logs = logs.clone();
+                                            let handle_error = handle_error.clone();
+                                            Callback::from(move |_| {
+                                                let logs = logs.clone();
+                                                let handle_error = handle_error.clone();
+                                                spawn_local(async move {
+                                                    match api_logs().await {
+                                                        Ok(entries) => logs.set(entries),
+                                                        Err(err) => handle_error(err),
+                                                    }
+                                                });
+                                            })
+                                        }}>{"Refresh"}</button>
                                         <select onchange={{
                                             let log_filter = log_filter.clone();
                                             Callback::from(move |e: Event| {

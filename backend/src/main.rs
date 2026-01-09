@@ -20,9 +20,10 @@ use axum::{
 use axum_server::{tls_rustls::RustlsConfig, Handle};
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{SinkExt, StreamExt};
 use hyper_util::rt::TokioIo;
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
@@ -38,13 +39,15 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{
     collections::hash_map::DefaultHasher,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    fs::{File, OpenOptions},
     hash::{Hash, Hasher},
+    io::Write,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -64,6 +67,10 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing::{error, info, warn};
+use tracing_subscriber::{
+    layer::Context as TraceContext, layer::SubscriberExt, registry::LookupSpan,
+    util::SubscriberInitExt, Layer,
+};
 use uuid::Uuid;
 use x509_parser::prelude::FromDer;
 use x509_parser::prelude::X509Certificate;
@@ -499,6 +506,98 @@ struct LogEntry {
     listener: Option<String>,
 }
 
+const LOG_DIR: &str = "data/logs";
+const LOG_BUFFER_CAP: usize = 1000;
+const LOG_RETENTION_DAYS: i64 = 14;
+
+static LOG_BUFFER: Lazy<RwLock<VecDeque<LogEntry>>> =
+    Lazy::new(|| RwLock::new(VecDeque::with_capacity(LOG_BUFFER_CAP)));
+static LOG_FILE: Lazy<Mutex<LogFileState>> = Lazy::new(|| Mutex::new(LogFileState::new()));
+
+struct LogFileState {
+    date: String,
+    file: Option<File>,
+}
+
+impl LogFileState {
+    fn new() -> Self {
+        Self {
+            date: String::new(),
+            file: None,
+        }
+    }
+}
+
+fn append_log(entry: &LogEntry) {
+    // In-memory buffer
+    {
+        let mut buf = LOG_BUFFER.write();
+        buf.push_back(entry.clone());
+        if buf.len() > LOG_BUFFER_CAP {
+            buf.pop_front();
+        }
+    }
+
+    // File append with daily rotation
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let mut state = LOG_FILE.lock().unwrap();
+    if state.date != today || state.file.is_none() {
+        let _ = std::fs::create_dir_all(LOG_DIR);
+        let path = FsPath::new(LOG_DIR).join(format!("balor-{today}.jsonl"));
+        state.file = OpenOptions::new().create(true).append(true).open(path).ok();
+        state.date = today.clone();
+    }
+
+    if let Some(file) = state.file.as_mut() {
+        if let Ok(line) = serde_json::to_string(entry) {
+            let _: std::io::Result<()> = writeln!(file, "{line}");
+        }
+    }
+}
+
+fn cleanup_old_logs() {
+    if let Ok(entries) = std::fs::read_dir(LOG_DIR) {
+        let cutoff = Utc::now() - ChronoDuration::days(LOG_RETENTION_DAYS);
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(time) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        if let Some(ts) = chrono::DateTime::<Utc>::from_timestamp(
+                            time.as_secs() as i64,
+                            time.subsec_nanos(),
+                        ) {
+                            if ts < cutoff {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct LogCollectorLayer;
+
+impl<S> Layer<S> for LogCollectorLayer
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: TraceContext<'_, S>) {
+        let meta = event.metadata();
+        let message = meta.name().to_string();
+        let entry = LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            level: meta.level().to_string(),
+            message,
+            target: Some(meta.target().to_string()),
+            listener: None,
+        };
+
+        append_log(&entry);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LogoutPayload {
     token: String,
@@ -546,9 +645,12 @@ async fn main() -> anyhow::Result<()> {
         panic!("failed to install rustls crypto provider: {:?}", err);
     }
 
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    cleanup_old_logs();
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(LogCollectorLayer)
         .init();
 
     let state_path = resolve_state_path();
@@ -583,12 +685,12 @@ async fn main() -> anyhow::Result<()> {
     let api = Router::new()
         .route("/health", get(health))
         .route("/version", get(version_info))
-        .route("/logs", get(list_logs))
         .route("/login", post(login))
         .route("/logout", post(logout))
         .merge(
             Router::new()
                 .route("/stats", get(stats))
+                .route("/logs", get(list_logs))
                 .route("/listeners", post(create_listener).get(list_listeners))
                 .route(
                     "/listeners/:id",
@@ -678,6 +780,14 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     Json(response)
 }
 
+async fn list_logs(
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<Vec<LogEntry>>, StatusCode> {
+    require_admin(&ctx)?;
+    let logs = LOG_BUFFER.read().iter().cloned().collect();
+    Ok(Json(logs))
+}
+
 async fn version_info() -> Json<VersionResponse> {
     let api_version = env!("CARGO_PKG_VERSION").to_string();
     let ui_version = std::env::var("BALOR_UI_VERSION").unwrap_or_else(|_| api_version.clone());
@@ -687,11 +797,6 @@ async fn version_info() -> Json<VersionResponse> {
         ui_version,
         build,
     })
-}
-
-async fn list_logs() -> Json<Vec<LogEntry>> {
-    // Placeholder: surface empty log list until structured logging buffer is wired.
-    Json(Vec::new())
 }
 
 async fn list_users(

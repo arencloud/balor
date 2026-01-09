@@ -279,6 +279,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-util",
+ "once_cell",
  "parking_lot",
  "prometheus",
  "rand 0.8.5",

@@ -41,3 +41,4 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 x509-parser = "0.16"
 urlencoding = "2.1"
 ureq = { version = "2.12", features = ["json"] }
+once_cell = "1"
