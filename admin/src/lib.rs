@@ -1463,7 +1463,8 @@ fn app() -> Html {
                                     { for log_files.iter().map(|f| {
                                         let log_file_view = log_file_view.clone();
                                         let handle_error = handle_error.clone();
-                                        let name = f.name.clone();
+                                        let download_name = f.name.clone();
+                                        let preview_name = f.name.clone();
                                         html!{
                                             <article class="card">
                                                 <div class="card-head">
@@ -1475,11 +1476,11 @@ fn app() -> Html {
                                                     <div class="pill-row">
                                                         <button class="ghost" type="button" onclick={Callback::from(move |_| {
                                                             if let Some(win) = web_sys::window() {
-                                                                let _ = win.open_with_url_and_target(&format!("/api/logs/files/{}", name), "_blank");
+                                                                let _ = win.open_with_url_and_target(&format!("/api/logs/files/{}", download_name), "_blank");
                                                             }
                                                         })}>{"Download"}</button>
                                                         <button class="ghost" type="button" onclick={Callback::from(move |_| {
-                                                            let name = name.clone();
+                                                            let name = preview_name.clone();
                                                             let log_file_view = log_file_view.clone();
                                                             let handle_error = handle_error.clone();
                                                             spawn_local(async move {
