@@ -270,6 +270,10 @@ struct AcmeStatus {
     message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     not_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_retry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1044,6 +1048,8 @@ async fn request_standalone_acme(
                     state: AcmeState::Pending,
                     message: None,
                     not_after: None,
+                    next_retry: None,
+                    attempts: Some(0),
                 }),
                 tls: None,
             });
@@ -1126,7 +1132,37 @@ async fn renew_standalone_job(
         }
     };
 
-    let tls = obtain_cert(host.clone(), acme_cfg.clone(), state.clone()).await?;
+    let tls = match obtain_cert(host.clone(), acme_cfg.clone(), state.clone()).await {
+        Ok(tls) => tls,
+        Err(err) => {
+            let attempts = {
+                let store = state.store.read();
+                store
+                    .acme_standalone
+                    .iter()
+                    .find(|j| j.host == host)
+                    .and_then(|j| j.status.as_ref().and_then(|s| s.attempts))
+                    .unwrap_or(0)
+                    .saturating_add(1)
+            };
+            let backoff = backoff_seconds(attempts);
+            let next_retry = (Utc::now() + chrono::Duration::seconds(backoff)).to_rfc3339();
+            {
+                let mut store = state.store.write();
+                if let Some(job) = store.acme_standalone.iter_mut().find(|j| j.host == host) {
+                    job.status = Some(AcmeStatus {
+                        state: AcmeState::Failed,
+                        message: Some(err.to_string()),
+                        not_after: None,
+                        next_retry: Some(next_retry),
+                        attempts: Some(attempts),
+                    });
+                }
+            }
+            persist_store(&state).map_err(|_| anyhow::anyhow!("persist failed"))?;
+            return Err(err);
+        }
+    };
     let not_after = cert_not_after(tls.cert_path.clone());
     let cert_name = label.unwrap_or_else(|| host.clone());
     register_certificate(&state, cert_name, &tls, "acme");
@@ -1139,6 +1175,8 @@ async fn renew_standalone_job(
                 state: AcmeState::Issued,
                 message: None,
                 not_after,
+                next_retry: None,
+                attempts: Some(0),
             });
         } else {
             store.acme_standalone.push(AcmeStandaloneJob {
@@ -1149,6 +1187,8 @@ async fn renew_standalone_job(
                     state: AcmeState::Issued,
                     message: None,
                     not_after,
+                    next_retry: None,
+                    attempts: Some(0),
                 }),
                 tls: Some(tls.clone()),
             });
@@ -2031,6 +2071,8 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
                                         .map(|t| t.cert_path.clone())
                                         .unwrap_or_default(),
                                 ),
+                                next_retry: None,
+                                attempts: Some(0),
                             });
                             changed = true;
                         }
@@ -2040,6 +2082,26 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
                                 state: AcmeState::Failed,
                                 message: Some(err.to_string()),
                                 not_after: None,
+                                next_retry: Some(
+                                    (Utc::now()
+                                        + chrono::Duration::seconds(backoff_seconds(
+                                            route
+                                                .acme_status
+                                                .as_ref()
+                                                .and_then(|s| s.attempts)
+                                                .unwrap_or(0)
+                                                .saturating_add(1),
+                                        )))
+                                    .to_rfc3339(),
+                                ),
+                                attempts: Some(
+                                    route
+                                        .acme_status
+                                        .as_ref()
+                                        .and_then(|s| s.attempts)
+                                        .unwrap_or(0)
+                                        .saturating_add(1),
+                                ),
                             });
                         }
                     }
@@ -2048,6 +2110,8 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
                         state: AcmeState::Pending,
                         message: None,
                         not_after: None,
+                        next_retry: None,
+                        attempts: Some(0),
                     });
                 }
             }
@@ -2123,9 +2187,23 @@ async fn obtain_cert(host: String, acme: AcmeConfig, state: AppState) -> anyhow:
                                     let chall = auth.dns_challenge();
                                     let proof = chall.dns_proof();
                                     perform_dns01(provider_name, &host, &proof, &state)?;
-                                    // Give DNS a moment to propagate, then validate with a longer window.
-                                    thread::sleep(Duration::from_secs(15));
-                                    chall.validate(30000)?;
+                                    // Retry validation a few times with modest backoff to allow propagation.
+                                    let mut attempts = 0;
+                                    loop {
+                                        attempts += 1;
+                                        // validate consumes the challenge, so re-fetch it after each refresh
+                                        let current = auth.dns_challenge();
+                                        current.validate(30000)?;
+                                        match ord_new.refresh() {
+                                            Ok(_) => break,
+                                            Err(err) if attempts < 3 => {
+                                                warn!("DNS-01 validation pending, retrying in 10s: {err}");
+                                                thread::sleep(Duration::from_secs(10));
+                                                continue;
+                                            }
+                                            Err(err) => return Err(err.into()),
+                                        }
+                                    }
                                 } else {
                                     return Err(anyhow::anyhow!(
                                         "DNS-01 requires provider configuration for {}",
@@ -2205,9 +2283,7 @@ fn perform_dns01(
     match provider.provider {
         DnsProvider::Cloudflare => update_cloudflare_dns(provider, host, proof),
         DnsProvider::Route53 => update_route53_dns(provider, host, proof),
-        DnsProvider::Generic => Err(anyhow::anyhow!(
-            "Generic DNS provider automation not implemented"
-        )),
+        DnsProvider::Generic => update_generic_dns(provider, host, proof),
     }
 }
 
@@ -2360,6 +2436,52 @@ fn update_route53_dns(
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async { client.change_resource_record_sets(req).await })?;
     Ok(())
+}
+
+fn update_generic_dns(
+    provider: &AcmeProviderConfig,
+    host: &str,
+    proof: &str,
+) -> anyhow::Result<()> {
+    let api_base = provider
+        .api_base
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Generic provider requires api_base URL"))?;
+    let name = format!(
+        "{}.{}",
+        provider
+            .txt_prefix
+            .clone()
+            .unwrap_or_else(|| "_acme-challenge".into()),
+        host.trim_start_matches("*."),
+    );
+    let agent = ureq::agent();
+    let mut req = agent.post(&api_base).set("Content-Type", "application/json");
+    if let Some(token) = provider.api_token.as_ref() {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    let body = serde_json::json!({
+        "type": "TXT",
+        "name": name,
+        "value": proof,
+        "ttl": 120,
+        "zone": provider.zone
+    });
+    let resp = req.send_json(body)?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(anyhow::anyhow!(
+            "Generic DNS provider returned {}",
+            resp.status()
+        ));
+    }
+    Ok(())
+}
+
+fn backoff_seconds(attempts: u32) -> i64 {
+    let base = 300u64; // 5 minutes
+    let max = 3600u64; // 1 hour cap
+    let exp = base.saturating_mul(2u64.saturating_pow(attempts.saturating_sub(1)));
+    std::cmp::min(exp, max) as i64
 }
 
 fn resolve_cloudflare_zone_id(
@@ -3612,6 +3734,8 @@ fn with_health(state: &AppState, mut cfg: ListenerConfig) -> ListenerConfig {
                     state: AcmeState::Pending,
                     message: None,
                     not_after: None,
+                    next_retry: None,
+                    attempts: Some(0),
                 });
             }
         }
@@ -3687,7 +3811,15 @@ async fn run_acme_renewal(state: &AppState) {
             .acme_standalone
             .iter()
             .filter(|j| {
-                j.status
+                let overdue = j
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.next_retry.as_ref())
+                    .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                    .map(|dt| dt.with_timezone(&Utc) <= Utc::now())
+                    .unwrap_or(true);
+                let expiring = j
+                    .status
                     .as_ref()
                     .and_then(|s| s.not_after.as_ref())
                     .and_then(|na| DateTime::parse_from_rfc3339(na).ok())
@@ -3695,7 +3827,8 @@ async fn run_acme_renewal(state: &AppState) {
                         let exp_utc = exp.with_timezone(&Utc);
                         (exp_utc - Utc::now()).num_days() <= 15
                     })
-                    .unwrap_or(true)
+                    .unwrap_or(true);
+                overdue || expiring
             })
             .map(|j| j.host.clone())
             .collect()

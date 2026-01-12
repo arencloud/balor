@@ -115,5 +115,5 @@ Environment knobs:
 - ✅ Metrics tab now includes latency quantiles (p50/p95/p99) derived from Prometheus buckets with quick visual cards
 - ✅ Logs tab (admin-only): live buffer view, level filter, and JSONL download/preview from the backend log store (retention + rotation)
 - ✅ Admin console port/TLS controls: default bind `0.0.0.0:9443`, UI control to change port and pick a console cert (restart required)
-- ⚠️ ACME automation: HTTP-01 + Cloudflare/Route53 DNS-01 with periodic renewal; Generic DNS-01 and renewal/backoff polish pending. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
+- ✅ ACME automation: HTTP-01 + Cloudflare/Route53/Generic (webhook) DNS-01 with periodic renewal and backoff retries. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes

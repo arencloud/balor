@@ -2329,97 +2329,216 @@ fn app() -> Html {
                                             <option value="generic" selected={acme_form.provider == DnsProvider::Generic}>{"Generic (token-based)"}</option>
                                         </select>
                                     </label>
-                                    <label class="field">
-                                        <span>{"API base URL"}</span>
-                                        <input
-                                            value={acme_form.provider_url.clone()}
-                                            oninput={{
-                                                let acme_form = acme_form.clone();
-                                                Callback::from(move |e: InputEvent| {
-                                                    let mut next = (*acme_form).clone();
-                                                    next.provider_url = event_value(&e);
-                                                    acme_form.set(next);
-                                                })
-                                            }}
-                                            placeholder="https://api.cloudflare.com/client/v4"
-                                        />
-                                    </label>
-                                    <label class="field">
-                                        <span>{"API token (use for Cloudflare / generic)"}</span>
-                                        <input
-                                            value={acme_form.api_token.clone()}
-                                            oninput={{
-                                                let acme_form = acme_form.clone();
-                                                Callback::from(move |e: InputEvent| {
-                                                    let mut next = (*acme_form).clone();
-                                                    next.api_token = event_value(&e);
-                                                    acme_form.set(next);
-                                                })
-                                            }}
-                                            placeholder="cf_pat_..."
-                                        />
-                                    </label>
-                                    <label class="field">
-                                        <span>{"Access key (Route53)"}</span>
-                                        <input
-                                            value={acme_form.access_key.clone()}
-                                            oninput={{
-                                                let acme_form = acme_form.clone();
-                                                Callback::from(move |e: InputEvent| {
-                                                    let mut next = (*acme_form).clone();
-                                                    next.access_key = event_value(&e);
-                                                    acme_form.set(next);
-                                                })
-                                            }}
-                                            placeholder="AKIA..."
-                                        />
-                                    </label>
-                                    <label class="field">
-                                        <span>{"Secret key (Route53)"}</span>
-                                        <input
-                                            value={acme_form.secret_key.clone()}
-                                            oninput={{
-                                                let acme_form = acme_form.clone();
-                                                Callback::from(move |e: InputEvent| {
-                                                    let mut next = (*acme_form).clone();
-                                                    next.secret_key = event_value(&e);
-                                                    acme_form.set(next);
-                                                })
-                                            }}
-                                            placeholder="******"
-                                            type="password"
-                                        />
-                                    </label>
-                                    <label class="field">
-                                        <span>{"Zone / domain (optional)"}</span>
-                                        <input
-                                            value={acme_form.zone.clone()}
-                                            oninput={{
-                                                let acme_form = acme_form.clone();
-                                                Callback::from(move |e: InputEvent| {
-                                                    let mut next = (*acme_form).clone();
-                                                    next.zone = event_value(&e);
-                                                    acme_form.set(next);
-                                                })
-                                            }}
-                                            placeholder="example.com"
-                                        />
-                                    </label>
-                                    <label class="field">
-                                        <span>{"TXT prefix"}</span>
-                                        <input
-                                            value={acme_form.txt_prefix.clone()}
-                                            oninput={{
-                                                let acme_form = acme_form.clone();
-                                                Callback::from(move |e: InputEvent| {
-                                                    let mut next = (*acme_form).clone();
-                                                    next.txt_prefix = event_value(&e);
-                                                    acme_form.set(next);
-                                                })
-                                            }}
-                                            placeholder="_acme-challenge"
-                                        />
-                                    </label>
+                                    { match acme_form.provider {
+                                        DnsProvider::Cloudflare => html!{
+                                            <>
+                                            <label class="field">
+                                                <span>{"API base URL"}</span>
+                                                <input
+                                                    value={acme_form.provider_url.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.provider_url = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="https://api.cloudflare.com/client/v4"
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"API token"}</span>
+                                                <input
+                                                    value={acme_form.api_token.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.api_token = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="cf_pat_..."
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"Zone / domain (optional)"}</span>
+                                                <input
+                                                    value={acme_form.zone.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.zone = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="example.com or zone id"
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"TXT prefix"}</span>
+                                                <input
+                                                    value={acme_form.txt_prefix.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.txt_prefix = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="_acme-challenge"
+                                                />
+                                            </label>
+                                            </>
+                                        },
+                                        DnsProvider::Route53 => html!{
+                                            <>
+                                            <label class="field">
+                                                <span>{"Region"}</span>
+                                                <input
+                                                    value={acme_form.provider_url.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.provider_url = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="us-east-1"
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"Access key"}</span>
+                                                <input
+                                                    value={acme_form.access_key.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.access_key = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="AKIA..."
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"Secret key"}</span>
+                                                <input
+                                                    value={acme_form.secret_key.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.secret_key = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="******"
+                                                    type="password"
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"Hosted zone ID or domain"}</span>
+                                                <input
+                                                    value={acme_form.zone.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.zone = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="Z123ABC... or example.com"
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"TXT prefix"}</span>
+                                                <input
+                                                    value={acme_form.txt_prefix.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.txt_prefix = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="_acme-challenge"
+                                                />
+                                            </label>
+                                            </>
+                                        },
+                                        DnsProvider::Generic => html!{
+                                            <>
+                                            <label class="field">
+                                                <span>{"API endpoint (webhook)"}</span>
+                                                <input
+                                                    value={acme_form.provider_url.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.provider_url = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="https://api.example.com/dns"
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"Bearer token (optional)"}</span>
+                                                <input
+                                                    value={acme_form.api_token.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.api_token = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="token..."
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"Zone / domain (optional)"}</span>
+                                                <input
+                                                    value={acme_form.zone.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.zone = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="example.com"
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>{"TXT prefix"}</span>
+                                                <input
+                                                    value={acme_form.txt_prefix.clone()}
+                                                    oninput={{
+                                                        let acme_form = acme_form.clone();
+                                                        Callback::from(move |e: InputEvent| {
+                                                            let mut next = (*acme_form).clone();
+                                                            next.txt_prefix = event_value(&e);
+                                                            acme_form.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="_acme-challenge"
+                                                />
+                                            </label>
+                                            </>
+                                        },
+                                    }}
                                     <div class="actions">
                                         <button class="primary" type="submit">{"Save provider"}</button>
                                         <button class="ghost" type="button" onclick={{
