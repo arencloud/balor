@@ -7,6 +7,7 @@ use gloo_timers::callback::Interval;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::f64;
+use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 use uuid::Uuid;
 use wasm_bindgen::{prelude::*, JsCast};
@@ -110,6 +111,8 @@ struct AcmeConfig {
     challenge: AcmeChallenge,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -154,6 +157,18 @@ struct CertificateBundle {
     key_path: String,
     #[serde(default)]
     source: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct StandaloneAcmeJob {
+    host: String,
+    #[serde(default)]
+    label: Option<String>,
+    acme: AcmeConfig,
+    #[serde(default)]
+    status: Option<AcmeStatus>,
+    #[serde(default)]
+    tls: Option<TlsConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -338,7 +353,10 @@ fn app() -> Html {
     let login_form = use_state(LoginForm::default);
     let acme_providers = use_state(Vec::<AcmeProviderConfig>::new);
     let acme_form = use_state(AcmeProviderForm::default);
+    let acme_schedule = use_state(AcmeScheduleForm::default);
+    let acme_standalone = use_state(AcmeScheduleForm::default);
     let acme_status = use_state(StatusLine::default);
+    let acme_jobs = use_state(Vec::<StandaloneAcmeJob>::new);
     let certs = use_state(Vec::<CertificateBundle>::new);
     let cert_form = use_state(CertificateForm::default);
     let cert_status = use_state(StatusLine::default);
@@ -375,10 +393,13 @@ fn app() -> Html {
         let metrics_rows = metrics_rows.clone();
         let acme_providers_state = acme_providers.clone();
         let handle_error_acme = handle_error.clone();
+        let acme_schedule_state = acme_schedule.clone();
+        let acme_standalone_state = acme_standalone.clone();
         let certs_effect = certs.clone();
         let handle_error_cert = handle_error.clone();
         let pools_state = pools.clone();
         let handle_error_pools = handle_error.clone();
+        let acme_jobs_state = acme_jobs.clone();
         let version_state = version_info.clone();
         let console_cfg_state = console_cfg.clone();
         let console_status_state = console_status.clone();
@@ -392,6 +413,7 @@ fn app() -> Html {
             let session = session.clone();
             let acme_providers = acme_providers_state.clone();
             let handle_error_acme = handle_error_acme.clone();
+            let acme_schedule_state = acme_schedule_state.clone();
             let certs_state = certs_effect.clone();
             let handle_error_cert = handle_error_cert.clone();
             let pools_state = pools_state.clone();
@@ -425,6 +447,12 @@ fn app() -> Html {
                                 Ok(list) => certs_state.set(list),
                                 Err(err) => handle_error_cert(err),
                             }
+                            if let Ok(jobs) = api_acme_jobs().await {
+                                acme_jobs_state.set(jobs);
+                            }
+                            // Reset schedule form defaults when entering the ACME tab.
+                            acme_schedule_state.set(AcmeScheduleForm::default());
+                            acme_standalone_state.set(AcmeScheduleForm::default());
                         }
                     }
                 });
@@ -486,6 +514,7 @@ fn app() -> Html {
         let logs_state = logs.clone();
         let handle_error = handle_error.clone();
         let status = status.clone();
+        let acme_jobs_handle = acme_jobs.clone();
         use_effect_with((*session).clone(), move |current: &Option<Session>| {
             if let Some(session) = current.clone() {
                 loading.set(true);
@@ -524,6 +553,9 @@ fn app() -> Html {
                         }
                         if let Ok(pools_resp) = api_pools().await {
                             pools.set(pools_resp);
+                        }
+                        if let Ok(jobs) = api_acme_jobs().await {
+                            acme_jobs_handle.set(jobs);
                         }
                     }
                     if version_state.is_none() {
@@ -799,6 +831,72 @@ fn app() -> Html {
     };
 
     let current_session = session.as_ref().cloned().unwrap();
+    let acme_cert_names: HashSet<String> = certs
+        .iter()
+        .filter(|c| c.source.to_lowercase().contains("acme"))
+        .map(|c| c.cert_path.rsplit('/').next().unwrap_or("").to_string())
+        .collect();
+    let acme_routes: Vec<(Uuid, String, HostRule)> = listeners
+        .iter()
+        .flat_map(|l| {
+            let acme_cert_names = acme_cert_names.clone();
+            l.host_routes
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(move |r| {
+                    let cert_match = r
+                        .tls
+                        .as_ref()
+                        .and_then(|t| t.cert_path.rsplit('/').next())
+                        .map(|b| acme_cert_names.contains(b))
+                        .unwrap_or(false);
+                    if r.acme.is_some() || cert_match {
+                        Some((l.id, l.name.clone(), r))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .collect();
+    let acme_job_cards: Vec<(Option<Uuid>, String, Option<String>, Option<AcmeConfig>, Option<AcmeStatus>, Option<TlsConfig>)> = {
+        let mut cards = Vec::new();
+        for (lid, _lname, route) in acme_routes.clone() {
+            cards.push((
+                Some(lid),
+                route.host.clone(),
+                route.pool.clone(),
+                route.acme.clone(),
+                route.acme_status.clone(),
+                route.tls.clone(),
+            ));
+        }
+        for job in (*acme_jobs).iter() {
+            cards.push((
+                None,
+                job.host.clone(),
+                None,
+                Some(job.acme.clone()),
+                job.status.clone(),
+                job.tls.clone(),
+            ));
+        }
+        cards
+    };
+    let acme_schedule_form = (*acme_schedule).clone();
+    let acme_hosts_for_schedule: Vec<String> = if let Ok(id) = Uuid::parse_str(&acme_schedule_form.listener) {
+        listeners
+            .iter()
+            .find(|l| l.id == id)
+            .and_then(|l| l.host_routes.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.host)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let acme_standalone_form = (*acme_standalone).clone();
 
     html! {
         <div class="page">
@@ -992,9 +1090,17 @@ fn app() -> Html {
                                                         })}
                                                     </select>
                                                 </label>
-                                                <div class="pill-row">
-                                                    <span class="pill pill-ghost mono">{tls.cert_path}</span>
-                                                </div>
+                                                {
+                                                    if !tls.cert_path.is_empty() {
+                                                        html!{
+                                                            <div class="pill-row">
+                                                                <span class="pill pill-ghost mono">{tls.cert_path}</span>
+                                                            </div>
+                                                        }
+                                                    } else {
+                                                        html!{}
+                                                    }
+                                                }
                                                 </>
                                             }
                                         } else { html!{} }
@@ -1255,13 +1361,13 @@ fn app() -> Html {
                                                                                 />
                                                                             </label>
                                                                             <label style="display:flex; align-items:center; gap:8px; padding:6px 12px; border-radius:12px; background:linear-gradient(120deg,#e7f5ff,#f0fbff); box-shadow:0 6px 18px rgba(15,23,42,0.08);">
-                                                                                <span class="muted">{"TLS/ACME"}</span>
+                                                                                <span class="muted">{"TLS"}</span>
                                                                                 <span class={classes!("pill", if rule.tls_enabled { "pill-on" } else { "pill-error" })}>
                                                                                     { if rule.tls_enabled { "On" } else { "Off" } }
                                                                                 </span>
                                                                                 <input
                                                                                     type="checkbox"
-                                                                                    aria-label="Toggle TLS/ACME for host"
+                                                                                    aria-label="Toggle TLS for host"
                                                                                     checked={rule.tls_enabled}
                                                                                     onchange={{
                                                                                         let form = form.clone();
@@ -1366,9 +1472,6 @@ fn app() -> Html {
                                                                             }
                                                                         }
                                                                     }
-                                                                    <div class="route-row" style="grid-column: 1 / -1;">
-                                                                        <p class="muted">{"ACME is managed centrally in the ACME dashboard. Host routes here use uploaded certificates only."}</p>
-                                                                    </div>
                                                                     <div class="route-row" style="grid-column: 1 / -1;">
                                                                         <p class="muted">{"Upstreams come from the selected pool."}</p>
                                                                     </div>
@@ -1666,67 +1769,502 @@ fn app() -> Html {
                                         <p class="eyebrow">{"ACME Automation"}</p>
                                         <h2>{"DNS providers & challenge settings"}</h2>
                                         <p class="muted">{"Configure DNS providers for DNS-01 challenges. HTTP-01 tokens are served automatically from the challenge directory."}</p>
+                                        <p class="muted mono">{"DNS Provider section"} </p>
                                     </div>
                                     <StatusBadge status={(*acme_status).clone()} />
                                 </div>
-                                {
-                                    let acme_routes: Vec<_> = listeners.iter().flat_map(|l| {
-                                        l.host_routes.clone().unwrap_or_default().into_iter().filter_map(move |r| {
-                                            if r.acme.is_some() {
-                                                Some((l.id, l.name.clone(), r))
-                                            } else {
-                                                None
+                                <div class="panel-head" style="margin-top:8px;">
+                                    <div>
+                                        <p class="eyebrow">{"Certificate scheduling"}</p>
+                                        <h3>{"Attach ACME to a host route"}</h3>
+                                        <p class="muted">{"Pick a listener + host route, then issue/renew with a selected DNS provider."}</p>
+                                    </div>
+                                </div>
+                                <div class="card soft" style="margin-top:8px;">
+                                <form class="form-grid" onsubmit={{
+                                    let acme_schedule = acme_schedule.clone();
+                                    let acme_status = acme_status.clone();
+                                    let handle_error = handle_error.clone();
+                                    let listeners_state = listeners.clone();
+                                    let acme_jobs_state = acme_jobs.clone();
+                                    Callback::from(move |e: SubmitEvent| {
+                                        e.prevent_default();
+                                        let form = (*acme_schedule).clone();
+                                        if form.listener.is_empty() || form.host.is_empty() {
+                                            acme_status.set(StatusLine::error("Select listener and host"));
+                                            return;
+                                        }
+                                        let listener_id = match Uuid::parse_str(&form.listener) {
+                                            Ok(id) => id,
+                                            Err(_) => {
+                                                acme_status.set(StatusLine::error("Invalid listener id"));
+                                                return;
                                             }
-                                        })
-                                    }).collect();
-                                    html!{
-                                        <div class="cards" style="margin-bottom:16px;">
-                                            { for acme_routes.iter().map(|(lid, lname, route)| {
-                                                let status = route.acme_status.clone();
-                                                let (label, class) = if let Some(st) = status {
-                                                    match st.state {
-                                                        AcmeState::Issued => (format!("ACME: valid until {}", st.not_after.unwrap_or_else(|| "n/a".into())), "pill pill-on"),
-                                                        AcmeState::Pending => ("ACME pending".into(), "pill pill-ghost"),
-                                                        AcmeState::Failed => (format!("ACME failed: {}", st.message.unwrap_or_else(|| "error".into())), "pill pill-error"),
+                                        };
+                                        let acme_cfg = AcmeConfig {
+                                            email: Some(form.email.clone()),
+                                            provider: if form.provider.is_empty() { None } else { Some(form.provider.clone()) },
+                                            directory_url: Some(form.directory_url.clone()),
+                                            challenge: form.challenge.clone(),
+                                            label: if form.label.is_empty() { None } else { Some(form.label.clone()) },
+                                            cache_dir: None,
+                                        };
+                                        let host = form.host.clone();
+                                        let acme_status = acme_status.clone();
+                                        let handle_error = handle_error.clone();
+                                        let listeners_state = listeners_state.clone();
+                                        let acme_jobs_state = acme_jobs_state.clone();
+                                        spawn_local(async move {
+                                            match api_acme_schedule(listener_id, host, acme_cfg).await {
+                                                Ok(_) => {
+                                                    let listeners_handle = listeners_state.clone();
+                                                    if let Ok(fresh) = api_listeners().await {
+                                                    listeners_handle.set(fresh);
+                                                    }
+                                                    if let Ok(jobs) = api_acme_jobs().await {
+                                                        acme_jobs_state.set(jobs);
+                                                    }
+                                                    acme_status.set(StatusLine::success("ACME scheduled"));
+                                                }
+                                                Err(err) => handle_error(err),
+                                            }
+                                        });
+                                    })
+                                }}>
+                                    <label class="field">
+                                        <span>{"Listener"}</span>
+                                        <select
+                                            onchange={{
+                                                let acme_schedule = acme_schedule.clone();
+                                                let listeners = listeners.clone();
+                                                Callback::from(move |e: Event| {
+                                                        let mut next = (*acme_schedule).clone();
+                                                        next.listener = select_value(&e).unwrap_or_default();
+                                                        if let Ok(id) = Uuid::parse_str(&next.listener) {
+                                                            if let Some(listener) = listeners.iter().find(|l| l.id == id) {
+                                                                if let Some(route) = listener.host_routes.clone().unwrap_or_default().first() {
+                                                                    next.host = route.host.clone();
+                                                                    next.label = route
+                                                                        .tls
+                                                                        .as_ref()
+                                                                        .map(|t| t.cert_path.rsplit('/').next().unwrap_or("").to_string())
+                                                                        .unwrap_or_default();
+                                                                } else {
+                                                                    next.host.clear();
+                                                                    next.label.clear();
+                                                                }
                                                     }
                                                 } else {
-                                                    ("ACME scheduled".into(), "pill pill-ghost")
-                                                };
-                                                html!{
-                                                    <article class="card">
-                                                        <div class="card-head">
-                                                            <div>
-                                                                <p class="eyebrow">{format!("Host {}", route.host)}</p>
-                                                                <h3>{format!("Listener {}", lname)}</h3>
-                                                                <p class="muted">{route.pool.clone().unwrap_or_else(|| "no pool".into())}</p>
-                                                            </div>
+                                                    next.host.clear();
+                                                    next.label.clear();
+                                                }
+                                                acme_schedule.set(next);
+                                            })
+                                            }}
+                                        >
+                                            <option value="" selected={acme_schedule_form.listener.is_empty()}>{"Select listener"}</option>
+                                            { for listeners.iter().map(|l| html!{
+                                                <option value={l.id.to_string()} selected={acme_schedule_form.listener == l.id.to_string()}>{&l.name}</option>
+                                            }) }
+                                        </select>
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Host route"}</span>
+                                        <select
+                                            onchange={{
+                                                let acme_schedule = acme_schedule.clone();
+                                                Callback::from(move |e: Event| {
+                                                    let mut next = (*acme_schedule).clone();
+                                                    next.host = select_value(&e).unwrap_or_default();
+                                                    acme_schedule.set(next);
+                                                })
+                                            }}
+                                        >
+                                            <option value="" selected={acme_schedule_form.host.is_empty()}>{"Select host"}</option>
+                                            { for acme_hosts_for_schedule.iter().map(|h| html!{
+                                                <option value={h.clone()} selected={acme_schedule_form.host == *h}>{h}</option>
+                                            }) }
+                                        </select>
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Friendly name (optional)"}</span>
+                                        <input
+                                            value={acme_schedule_form.label.clone()}
+                                            oninput={{
+                                                let acme_schedule = acme_schedule.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*acme_schedule).clone();
+                                                    next.label = event_value(&e);
+                                                    acme_schedule.set(next);
+                                                })
+                                            }}
+                                            placeholder="cert-friendly-name"
+                                        />
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Contact email"}</span>
+                                        <input
+                                            value={acme_schedule_form.email.clone()}
+                                            oninput={{
+                                                let acme_schedule = acme_schedule.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*acme_schedule).clone();
+                                                    next.email = event_value(&e);
+                                                    acme_schedule.set(next);
+                                                })
+                                            }}
+                                            placeholder="ops@example.com"
+                                        />
+                                    </label>
+                                    <label class="field">
+                                        <span>{"DNS provider"}</span>
+                                        <select
+                                            onchange={{
+                                                let acme_schedule = acme_schedule.clone();
+                                                Callback::from(move |e: Event| {
+                                                    let mut next = (*acme_schedule).clone();
+                                                    next.provider = select_value(&e).unwrap_or_default();
+                                                    acme_schedule.set(next);
+                                                })
+                                            }}
+                                        >
+                                            <option value="" selected={acme_schedule_form.provider.is_empty()}>{"Select provider"}</option>
+                                            { for acme_providers.iter().map(|p| html!{
+                                                <option value={p.name.clone()} selected={acme_schedule_form.provider == p.name}>{format!("{} ({:?})", p.name, p.provider)}</option>
+                                            }) }
+                                        </select>
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Directory URL"}</span>
+                                        <input
+                                            value={acme_schedule_form.directory_url.clone()}
+                                            oninput={{
+                                                let acme_schedule = acme_schedule.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*acme_schedule).clone();
+                                                    next.directory_url = event_value(&e);
+                                                    acme_schedule.set(next);
+                                                })
+                                            }}
+                                        />
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Challenge type"}</span>
+                                        <select onchange={{
+                                            let acme_schedule = acme_schedule.clone();
+                                            Callback::from(move |e: Event| {
+                                                let mut next = (*acme_schedule).clone();
+                                                next.challenge = select_value(&e)
+                                                    .and_then(|v| serde_json::from_str(&format!("\"{}\"", v)).ok())
+                                                    .unwrap_or(AcmeChallenge::Dns01);
+                                                acme_schedule.set(next);
+                                            })
+                                        }}>
+                                            <option value="DNS-01" selected={matches!(acme_schedule_form.challenge, AcmeChallenge::Dns01)}>{"DNS-01"}</option>
+                                            <option value="HTTP-01" selected={matches!(acme_schedule_form.challenge, AcmeChallenge::Http01)}>{"HTTP-01"}</option>
+                                        </select>
+                                    </label>
+                                    <div class="actions span-12">
+                                        <button class="primary" type="submit">{"Schedule ACME"}</button>
+                                    </div>
+                                </form>
+                                </div>
+                                <div class="panel-head" style="margin-top:16px;">
+                                    <div>
+                                        <p class="eyebrow">{"Standalone certificates"}</p>
+                                        <h3>{"Request ACME cert without binding to a listener"}</h3>
+                                        <p class="muted">{"Issues and stores a certificate; attach it to listeners later."}</p>
+                                    </div>
+                                </div>
+                                <div class="card soft" style="margin-top:8px;">
+                                <form class="form-grid" onsubmit={{
+                                    let acme_standalone = acme_standalone.clone();
+                                    let acme_status = acme_status.clone();
+                                    let handle_error = handle_error.clone();
+                                    Callback::from(move |e: SubmitEvent| {
+                                        e.prevent_default();
+                                        let form = (*acme_standalone).clone();
+                                        if form.host.is_empty() {
+                                            acme_status.set(StatusLine::error("Host is required"));
+                                            return;
+                                        }
+                                        let acme_cfg = AcmeConfig {
+                                            email: Some(form.email.clone()),
+                                            provider: if form.provider.is_empty() { None } else { Some(form.provider.clone()) },
+                                            directory_url: Some(form.directory_url.clone()),
+                                            challenge: form.challenge.clone(),
+                                            label: if form.label.is_empty() { None } else { Some(form.label.clone()) },
+                                            cache_dir: None,
+                                        };
+                                        let host = form.host.clone();
+                                        let acme_status = acme_status.clone();
+                                        let handle_error = handle_error.clone();
+                                        spawn_local(async move {
+                                            match api_acme_request(host, acme_cfg).await {
+                                                Ok(_) => acme_status.set(StatusLine::success("Standalone ACME requested")),
+                                                Err(err) => handle_error(err),
+                                            }
+                                        });
+                                    })
+                                }}>
+                                    <label class="field">
+                                        <span>{"Hostname"}</span>
+                                        <input
+                                            value={acme_standalone_form.host.clone()}
+                                            oninput={{
+                                                let acme_standalone = acme_standalone.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*acme_standalone).clone();
+                                                    next.host = event_value(&e);
+                                                            acme_standalone.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="api.example.com"
+                                                />
+                                            </label>
+                                    <label class="field">
+                                        <span>{"Friendly name (optional)"}</span>
+                                        <input
+                                            value={acme_standalone_form.label.clone()}
+                                            oninput={{
+                                                let acme_standalone = acme_standalone.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*acme_standalone).clone();
+                                                    next.label = event_value(&e);
+                                                            acme_standalone.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="cert-friendly-name"
+                                                />
+                                            </label>
+                                    <label class="field">
+                                        <span>{"Contact email"}</span>
+                                        <input
+                                            value={acme_standalone_form.email.clone()}
+                                            oninput={{
+                                                let acme_standalone = acme_standalone.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*acme_standalone).clone();
+                                                    next.email = event_value(&e);
+                                                            acme_standalone.set(next);
+                                                        })
+                                                    }}
+                                                    placeholder="ops@example.com"
+                                                />
+                                            </label>
+                                    <label class="field">
+                                        <span>{"DNS provider"}</span>
+                                        <select
+                                            onchange={{
+                                                let acme_standalone = acme_standalone.clone();
+                                                        Callback::from(move |e: Event| {
+                                                            let mut next = (*acme_standalone).clone();
+                                                            next.provider = select_value(&e).unwrap_or_default();
+                                                            acme_standalone.set(next);
+                                                        })
+                                                    }}
+                                        >
+                                            <option value="" selected={acme_standalone_form.provider.is_empty()}>{"Select provider"}</option>
+                                            { for acme_providers.iter().map(|p| html!{
+                                                <option value={p.name.clone()} selected={acme_standalone_form.provider == p.name}>{format!("{} ({:?})", p.name, p.provider)}</option>
+                                            }) }
+                                        </select>
+                                    </label>
+                                    <label class="field">
+                                        <span>{"Directory URL"}</span>
+                                        <input
+                                            value={acme_standalone_form.directory_url.clone()}
+                                            oninput={{
+                                                let acme_standalone = acme_standalone.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    let mut next = (*acme_standalone).clone();
+                                                    next.directory_url = event_value(&e);
+                                                            acme_standalone.set(next);
+                                                        })
+                                                    }}
+                                                />
+                                            </label>
+                                    <label class="field">
+                                        <span>{"Challenge type"}</span>
+                                        <select onchange={{
+                                            let acme_standalone = acme_standalone.clone();
+                                            Callback::from(move |e: Event| {
+                                                    let mut next = (*acme_standalone).clone();
+                                                    next.challenge = select_value(&e)
+                                                        .and_then(|v| serde_json::from_str(&format!("\"{}\"", v)).ok())
+                                                        .unwrap_or(AcmeChallenge::Dns01);
+                                                    acme_standalone.set(next);
+                                                })
+                                            }}>
+                                                <option value="DNS-01" selected={matches!(acme_standalone_form.challenge, AcmeChallenge::Dns01)}>{"DNS-01"}</option>
+                                                <option value="HTTP-01" selected={matches!(acme_standalone_form.challenge, AcmeChallenge::Http01)}>{"HTTP-01"}</option>
+                                            </select>
+                                        </label>
+                                        <div class="actions span-12">
+                                            <button class="primary" type="submit">{"Request standalone certificate"}</button>
+                                        </div>
+                                </form>
+                                </div>
+                                <div class="panel-head" style="margin-top:16px;">
+                                    <div>
+                                        <p class="eyebrow">{"Scheduled certificates"}</p>
+                                        <h3>{"ACME jobs (host-bound & standalone)"}</h3>
+                                        <p class="muted">{"Review, renew, edit, or remove existing ACME schedules. Issued certs live in the Certificates tab."}</p>
+                                    </div>
+                                </div>
+                                <div class="cards" style="margin-bottom:16px;">
+                                    { for acme_job_cards.iter().map(|(lid_opt, host, pool, acme_cfg, status, tls)| {
+                                        let cert_match = tls
+                                            .as_ref()
+                                            .and_then(|t| t.cert_path.rsplit('/').next())
+                                            .map(|b| acme_cert_names.contains(b))
+                                            .unwrap_or(false);
+                                        let show_actions = acme_cfg.is_some();
+                                        let (label, class) = if let Some(st) = status {
+                                            match st.state {
+                                                AcmeState::Issued => (format!("ACME: valid until {}", st.not_after.clone().unwrap_or_else(|| "n/a".into())), "pill pill-on"),
+                                                AcmeState::Pending => ("ACME pending".into(), "pill pill-ghost"),
+                                                AcmeState::Failed => (format!("ACME failed: {}", st.message.clone().unwrap_or_else(|| "error".into())), "pill pill-error"),
+                                            }
+                                        } else if acme_cfg.is_some() {
+                                            ("ACME scheduled".into(), "pill pill-ghost")
+                                        } else if cert_match {
+                                            ("ACME certificate present".into(), "pill pill-on")
+                                        } else {
+                                            ("ACME scheduled".into(), "pill pill-ghost")
+                                        };
+                                        let listeners_state = listeners.clone();
+                                        let listeners_state_for_renew = listeners_state.clone();
+                                        let listeners_state_for_remove = listeners_state.clone();
+                                        let acme_jobs_state = acme_jobs.clone();
+                                        let acme_jobs_state_for_remove = acme_jobs.clone();
+                                        let host_disp = host.clone();
+                                        let pool_disp = pool.clone().unwrap_or_else(|| "Standalone".into());
+                                        html!{
+                                            <article class="card">
+                                            <div class="card-head">
+                                                <div>
+                                                    <p class="eyebrow">{format!("Host {}", host_disp)}</p>
+                                                    <h3>{
+                                                        if let Some(lid) = lid_opt {
+                                                            let name = listeners.iter().find(|l| l.id == *lid).map(|l| l.name.clone()).unwrap_or_else(|| "Listener".into());
+                                                            name
+                                                        } else {
+                                                            "Standalone".into()
+                                                        }
+                                                    }</h3>
+                                                    <p class="muted">{pool_disp}</p>
+                                                </div>
+                                                { if show_actions {
+                                                    html!{
+                                                        <div class="pill-row">
                                                             <button class="ghost" type="button" onclick={{
-                                                                let id = *lid;
+                                                                let lid_opt = *lid_opt;
+                                                                let host = host.clone();
                                                                 let acme_status = acme_status.clone();
                                                                 let handle_error = handle_error.clone();
                                                                 Callback::from(move |_| {
                                                                     let acme_status = acme_status.clone();
                                                                     let handle_error = handle_error.clone();
+                                                                    let listeners_state_inner = listeners_state_for_renew.clone();
+                                                                    let host_val = host.clone();
+                                                                    let acme_jobs_state = acme_jobs_state.clone();
                                                                     spawn_local(async move {
-                                                                        match api_acme_renew(id).await {
-                                                                            Ok(_) => acme_status.set(StatusLine::success("Renewal triggered")),
+                                                                        let result = if let Some(lid) = lid_opt {
+                                                                            api_acme_renew(lid).await
+                                                                        } else {
+                                                                            api_acme_renew_standalone(host_val.clone()).await
+                                                                        };
+                                                                        match result {
+                                                                            Ok(_) => {
+                                                                                if let Ok(fresh) = api_listeners().await {
+                                                                                    listeners_state_inner.set(fresh);
+                                                                                }
+                                                                                if let Ok(jobs) = api_acme_jobs().await {
+                                                                                    acme_jobs_state.set(jobs);
+                                                                                }
+                                                                                acme_status.set(StatusLine::success("Renewal triggered"));
+                                                                            }
                                                                             Err(err) => handle_error(err),
                                                                         }
                                                                     });
                                                                 })
                                                             }}>{"Renew now"}</button>
+                                                            <button class="ghost" type="button" onclick={{
+                                                                let acme_schedule = acme_schedule.clone();
+                                                                let host = host.clone();
+                                                                let acme_cfg = acme_cfg.clone();
+                                                                Callback::from(move |_| {
+                                                                    if let Some(cfg) = acme_cfg.clone() {
+                                                                        let mut next = (*acme_schedule).clone();
+                                                                        next.host = host.clone();
+                                                                        next.email = cfg.email.clone().unwrap_or_default();
+                                                                        next.provider = cfg.provider.clone().unwrap_or_default();
+                                                                        next.directory_url = cfg.directory_url.clone().unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".into());
+                                                                        next.challenge = cfg.challenge.clone();
+                                                                        if let Some(lbl) = cfg.label.clone() {
+                                                                            next.label = lbl;
+                                                                        }
+                                                                        acme_schedule.set(next);
+                                                                    }
+                                                                })
+                                                            }}>{"Edit schedule"}</button>
+                                                            <button class="ghost" type="button" onclick={{
+                                                                let acme_status = acme_status.clone();
+                                                                let handle_error = handle_error.clone();
+                                                                let host = host.clone();
+                                                                let lid_opt = *lid_opt;
+                                                                let listeners_state = listeners_state_for_remove.clone();
+                                                                Callback::from(move |_| {
+                                                                    let acme_status_cb = acme_status.clone();
+                                                                    let handle_error_cb = handle_error.clone();
+                                                                    let host_cb = host.clone();
+                                                                    let listeners_handle = listeners_state.clone();
+                                                                    let acme_jobs_state = acme_jobs_state_for_remove.clone();
+                                                                    spawn_local(async move {
+                                                                        let result = if let Some(lid) = lid_opt {
+                                                                            api_acme_unschedule(lid, host_cb.clone()).await
+                                                                        } else {
+                                                                            api_acme_delete_standalone(host_cb.clone()).await
+                                                                        };
+                                                                        match result {
+                                                                            Ok(_) => {
+                                                                                if let Ok(fresh) = api_listeners().await {
+                                                                                    listeners_handle.set(fresh);
+                                                                                }
+                                                                                if let Ok(jobs) = api_acme_jobs().await {
+                                                                                    acme_jobs_state.set(jobs);
+                                                                                }
+                                                                                acme_status_cb.set(StatusLine::success("ACME schedule removed"));
+                                                                            }
+                                                                            Err(err) => handle_error_cb(err),
+                                                                        }
+                                                                    });
+                                                                })
+                                                            }}>{"Remove"}</button>
                                                         </div>
-                                                        <div class="pill-row">
-                                                            <span class={classes!(class)}>{label}</span>
-                                                            { if let Some(tls) = &route.tls { html!{<span class="pill pill-ghost mono">{&tls.cert_path}</span>} } else { html!{} } }
-                                                        </div>
-                                                    </article>
-                                                }
-                                            }) }
-                                            { if acme_routes.is_empty() { html!{<p class="muted">{"No ACME-enabled host routes. Configure issuance here and certificates will appear in the Certificates tab."}</p>} } else { html!{} } }
-                                        </div>
-                                    }
-                                }
+                                                    }
+                                                } else {
+                                                    html!{}
+                                                }}
+                                            </div>
+                                                <div class="pill-row">
+                                                    <span class={classes!(class)}>{label}</span>
+                                                    { if let Some(t) = tls { html!{<span class="pill pill-ghost mono">{t.cert_path.clone()}</span>} } else { html!{} } }
+                                                    { if let Some(cfg) = acme_cfg { if let Some(lbl) = cfg.label.clone() { html!{<span class="pill pill-ghost">{lbl}</span>} } else { html!{} } } else { html!{} } }
+                                                </div>
+                                            </article>
+                                        }
+                                    }) }
+                                    { if acme_job_cards.is_empty() { html!{<p class="muted">{"No ACME schedules yet. Use the forms above to add one."}</p>} } else { html!{} } }
+                                </div>
+                                <div class="panel-head" style="margin-top:16px;">
+                                    <div>
+                                        <p class="eyebrow">{"DNS providers"}</p>
+                                        <h3>{"Credentials for DNS-01"}</h3>
+                                        <p class="muted">{"Store provider tokens/keys here, then pick a provider when scheduling certificates."}</p>
+                                    </div>
+                                </div>
                                 <form class="form-grid" onsubmit={{
                                     let acme_form = acme_form.clone();
                                     let acme_providers = acme_providers.clone();
@@ -2644,6 +3182,17 @@ struct AcmeProviderForm {
     txt_prefix: String,
 }
 
+#[derive(Clone)]
+struct AcmeScheduleForm {
+    listener: String,
+    host: String,
+    label: String,
+    email: String,
+    provider: String,
+    directory_url: String,
+    challenge: AcmeChallenge,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct CertificateForm {
     name: String,
@@ -2698,7 +3247,7 @@ impl Default for HostRuleForm {
         Self {
             host: String::new(),
             enabled: true,
-            tls_enabled: true,
+            tls_enabled: false,
             upstreams_text: String::from("http://127.0.0.1:7000"),
             pool: String::new(),
             selected_cert: String::new(),
@@ -2720,6 +3269,20 @@ impl Default for AcmeProviderForm {
             secret_key: String::new(),
             zone: String::new(),
             txt_prefix: "_acme-challenge".into(),
+        }
+    }
+}
+
+impl Default for AcmeScheduleForm {
+    fn default() -> Self {
+        Self {
+            listener: String::new(),
+            host: String::new(),
+            label: String::new(),
+            email: String::new(),
+            provider: String::new(),
+            directory_url: "https://acme-v02.api.letsencrypt.org/directory".into(),
+            challenge: AcmeChallenge::Dns01,
         }
     }
 }
@@ -2863,7 +3426,7 @@ impl ListenerForm {
             .unwrap_or_default()
             .into_iter()
             .map(|r| {
-                let mut form = HostRuleForm {
+                let form = HostRuleForm {
                     host: r.host,
                     enabled: r.enabled,
                     tls_enabled: r.tls.is_some() || r.acme.is_some(),
@@ -3024,6 +3587,7 @@ impl ListenerForm {
                 challenge: self.acme_challenge.clone(),
                 provider: (!self.acme_provider.trim().is_empty())
                     .then(|| self.acme_provider.clone()),
+                label: None,
             })
         } else {
             None
@@ -3493,6 +4057,81 @@ async fn api_acme_providers() -> Result<Vec<AcmeProviderConfig>, String> {
     parse_json_response::<Vec<AcmeProviderConfig>>(resp).await
 }
 
+async fn api_acme_schedule(listener: Uuid, host: String, acme: AcmeConfig) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct SchedulePayload {
+        listener: Uuid,
+        host: String,
+        acme: AcmeConfig,
+    }
+    let body = serde_json::to_string(&SchedulePayload {
+        listener,
+        host,
+        acme,
+    })
+    .map_err(|e| e.to_string())?;
+    let resp = with_auth(Request::post("/api/acme/schedule"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .map_err(|e| format!("request failed: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+async fn api_acme_jobs() -> Result<Vec<StandaloneAcmeJob>, String> {
+    let resp = with_auth(Request::get("/api/acme/standalone"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<Vec<StandaloneAcmeJob>>(resp).await
+}
+
+async fn api_acme_renew_standalone(host: String) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct RenewPayload {
+        host: String,
+    }
+    let body = serde_json::to_string(&RenewPayload { host }).map_err(|e| e.to_string())?;
+    let resp = with_auth(Request::post("/api/acme/standalone/renew"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .map_err(|e| format!("request failed: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+async fn api_acme_delete_standalone(host: String) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct DeletePayload {
+        host: String,
+    }
+    let body = serde_json::to_string(&DeletePayload { host }).map_err(|e| e.to_string())?;
+    let resp = with_auth(Request::post("/api/acme/standalone/delete"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .map_err(|e| format!("request failed: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
 async fn api_logs() -> Result<Vec<LogEntry>, String> {
     let resp = with_auth(Request::get("/api/logs"))
         .send()
@@ -3523,6 +4162,61 @@ async fn api_save_console(payload: AdminConsoleConfig) -> Result<AdminConsoleCon
 
 async fn api_acme_renew(listener: Uuid) -> Result<(), String> {
     let resp = with_auth(Request::post(&format!("/api/acme/renew/{listener}")))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+#[allow(dead_code)]
+async fn api_acme_renew_all() -> Result<(), String> {
+    let resp = with_auth(Request::post("/api/acme/renew_all"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+async fn api_acme_unschedule(listener: Uuid, host: String) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct UnschedulePayload {
+        listener: Uuid,
+        host: String,
+    }
+    let body = serde_json::to_string(&UnschedulePayload { listener, host }).map_err(|e| e.to_string())?;
+    let resp = with_auth(Request::post("/api/acme/unschedule"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .map_err(|e| format!("request failed: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+async fn api_acme_request(host: String, acme: AcmeConfig) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct RequestPayload {
+        host: String,
+        acme: AcmeConfig,
+    }
+    let body = serde_json::to_string(&RequestPayload { host, acme }).map_err(|e| e.to_string())?;
+    let resp = with_auth(Request::post("/api/acme/request"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .map_err(|e| format!("request failed: {e}"))?
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -3694,6 +4388,18 @@ async fn parse_json_response<T: for<'de> Deserialize<'de>>(
     }
 
     serde_json::from_str(&body).map_err(|e| format!("parse failed: {e}; body: {body}"))
+}
+
+async fn parse_error(resp: gloo_net::http::Response) -> String {
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("read failed: {e}"));
+    if status == 401 {
+        clear_session_storage();
+    }
+    format!("{status}: {body}")
 }
 
 #[derive(Clone, PartialEq)]

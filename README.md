@@ -7,7 +7,8 @@ Rust-native L4/L7 load balancer with an Axum admin API and a Yew (WASM) control 
 </p>
 
 **Author:** Eduard Gevorkyan (egevorky@arencloud.com)  
-**License:** Apache 2.0
+**License:** Apache 2.0  
+**Current version:** UI 0.1.1 • API 0.1.1 • build `dev`
 
 ## Architecture
 
@@ -65,6 +66,7 @@ Environment knobs:
 - `BALOR_STATE_FILE` (default `data/balor_state.json`) – persisted listener config storage.
 - `BALOR_DEFAULT_ADMIN_PASSWORD` (default `admin`) – bootstrap password for the auto-created `admin` user if no users exist.
 - `BALOR_ADMIN_TOKEN` (optional) – alternative bearer token that always maps to `admin` role (bypasses password).
+- `BALOR_BOOTSTRAP_SECRET_FILE` (default `data/admin-bootstrap.txt`) – when no users exist and no `BALOR_DEFAULT_ADMIN_PASSWORD` is set, a strong password is generated and written here (mode 600) for first login; rotate and delete after use.
 
 ## API sketch
 - `GET /api/health` – service heartbeat.
@@ -75,6 +77,9 @@ Environment knobs:
 - `PUT /api/listeners/{id}` – update a listener.
 - `DELETE /api/listeners/{id}` – remove a listener and stop its runtime.
 - `GET/POST/DELETE /api/pools` – manage reusable upstream pools (attach to host routes).
+- `GET/POST/PUT/DELETE /api/acme/providers` – manage DNS-01 provider profiles (Cloudflare, Route53, generic).
+- `POST /api/acme/request` – schedule an ACME issuance (host-bound or standalone) and persist the job; `GET /api/acme/standalone`, `/acme/standalone/renew`, `/acme/standalone/delete` manage standalone jobs.
+- `GET /api/certificates` – list uploaded/issued certs; `POST` uploads a PEM bundle.
 - `POST /api/login` / `POST /api/logout` – session tokens for the UI.
 - `GET/POST/PUT/DELETE /api/users` – RBAC user management (admin only).
 
@@ -88,7 +93,7 @@ Environment knobs:
 - RBAC roles: Admin (full), Operator (CRUD listeners), Viewer (read-only).
 - Prometheus metrics exposed at `/metrics` (HTTP counters/latency and TCP connection totals per listener).
 - WebSocket pass-through supported for HTTP listeners (upgrade + bidirectional frames).
-- ACME automation: HTTP-01 responder serves tokens from `BALOR_ACME_CHALLENGE_DIR` (default `data/acme-challenges`); HTTP-01 issuance now runs automatically for host routes that request ACME and stores PEMs under `data/certs`. DNS-01 flow uses provider profiles (Cloudflare, Route53, generic) in the Admin UI, but automation is still pending.
+- ACME automation: HTTP-01 responder serves tokens from `BALOR_ACME_CHALLENGE_DIR` (default `data/acme-challenges`); HTTP-01 issuance now runs automatically for host routes that request ACME and stores PEMs under `data/certs`. DNS-01 flow uses provider profiles (Cloudflare, Route53, generic); Cloudflare automation shipped, Route53/generic automation still pending. Standalone ACME jobs persist with validity dates and can be renewed from the UI.
 - Certificates dashboard: upload/download manual PEM bundles (stored under `BALOR_CERT_DIR`, default `data/certs`) from the Admin UI Certificates tab.
 - ACME provider type auto-sets API base URLs (Cloudflare/Route53) with overrides allowed.
 - The UI defaults to a sample listen address (`0.0.0.0:9000`) and a single upstream; adjust per environment.
@@ -109,5 +114,6 @@ Environment knobs:
 - ✅ Version banner: UI/API/build version surfaced via `/api/version` and shown in the header
 - ✅ Metrics tab now includes latency quantiles (p50/p95/p99) derived from Prometheus buckets with quick visual cards
 - ✅ Logs tab (admin-only): live buffer view, level filter, and JSONL download/preview from the backend log store (retention + rotation)
-- ⚠️ ACME automation: HTTP-01 + Cloudflare DNS-01 with periodic renewal; Route53/Generic DNS-01 and renewal/backoff polish pending; existing ACME certs are reused on edit to avoid needless re-issuance
+- ✅ Admin console port/TLS controls: default bind `0.0.0.0:9443`, UI control to change port and pick a console cert (restart required)
+- ⚠️ ACME automation: HTTP-01 + Cloudflare/Route53 DNS-01 with periodic renewal; Generic DNS-01 and renewal/backoff polish pending. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes

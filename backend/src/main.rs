@@ -134,6 +134,8 @@ struct AcmeConfig {
     challenge: AcmeChallenge,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +321,18 @@ fn default_cert_source() -> String {
     "manual".to_string()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcmeStandaloneJob {
+    host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    acme: AcmeConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<AcmeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<TlsConfig>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ConfigStore {
     #[serde(default)]
@@ -328,6 +342,8 @@ struct ConfigStore {
     users: HashMap<Uuid, UserRecord>,
     #[serde(default)]
     acme_providers: Vec<AcmeProviderConfig>,
+    #[serde(default)]
+    acme_standalone: Vec<AcmeStandaloneJob>,
     #[serde(default)]
     certificates: Vec<CertificateBundle>,
     #[serde(default)]
@@ -744,6 +760,13 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route("/acme/providers/:name", delete(delete_acme_provider))
                 .route("/acme/renew/:id", post(renew_acme_listener))
+                .route("/acme/renew_all", post(renew_acme_all))
+                .route("/acme/schedule", post(schedule_acme))
+                .route("/acme/unschedule", post(unschedule_acme))
+                .route("/acme/request", post(request_standalone_acme))
+                .route("/acme/standalone", get(list_acme_standalone))
+                .route("/acme/standalone/renew", post(renew_acme_standalone))
+                .route("/acme/standalone/delete", post(delete_acme_standalone))
                 .route("/pools", get(list_pools).post(upsert_pool))
                 .route("/pools/:name", delete(delete_pool))
                 .route("/certs", get(list_certs).post(upload_cert))
@@ -833,6 +856,30 @@ struct ConsolePayload {
     tls: Option<TlsPayload>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AcmeSchedulePayload {
+    listener: Uuid,
+    host: String,
+    acme: AcmeConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcmeUnschedulePayload {
+    listener: Uuid,
+    host: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcmeStandalonePayload {
+    host: String,
+    acme: AcmeConfig,
+}
+
+#[derive(Deserialize)]
+struct AcmeStandaloneRenewPayload {
+    host: String,
+}
+
 async fn update_console_settings(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
@@ -869,11 +916,247 @@ async fn renew_acme_listener(
     Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&ctx)?;
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
     ensure_acme_for_listener(state.clone(), id)
         .await
-        .map_err(|e| ApiError::Internal)?;
+        .map_err(|_| ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn renew_acme_all(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
+    let listeners: Vec<Uuid> = {
+        let store = state.store.read();
+        store
+            .listeners
+            .iter()
+            .filter_map(|(id, l)| {
+                l.host_routes
+                    .as_ref()
+                    .map(|r| r.iter().any(|h| h.acme.is_some()))
+                    .unwrap_or(false)
+                    .then_some(*id)
+            })
+            .collect()
+    };
+    for id in listeners {
+        if let Err(err) = ensure_acme_for_listener(state.clone(), id).await {
+            warn!("ACME renew failed for {id}: {err:?}");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn schedule_acme(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<AcmeSchedulePayload>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
+
+    {
+        let store = state.store.read();
+        validate_acme_config(&Some(payload.acme.clone()), &store).map_err(ApiError::BadRequest)?;
+    }
+
+    {
+        let mut store = state.store.write();
+        let listener = store
+            .listeners
+            .get_mut(&payload.listener)
+            .ok_or(ApiError::NotFound)?;
+        let routes = listener
+            .host_routes
+            .as_mut()
+            .ok_or(ApiError::BadRequest("listener has no host routes".into()))?;
+        if let Some(route) = routes.iter_mut().find(|r| r.host == payload.host) {
+            route.acme = Some(payload.acme.clone());
+        } else {
+            return Err(ApiError::NotFound);
+        }
+    }
+
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
+    ensure_acme_for_listener(state.clone(), payload.listener)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unschedule_acme(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<AcmeUnschedulePayload>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
+
+    {
+        let mut store = state.store.write();
+        let listener = store
+            .listeners
+            .get_mut(&payload.listener)
+            .ok_or(ApiError::NotFound)?;
+        let routes = listener
+            .host_routes
+            .as_mut()
+            .ok_or(ApiError::BadRequest("listener has no host routes".into()))?;
+        if let Some(route) = routes.iter_mut().find(|r| r.host == payload.host) {
+            route.acme = None;
+            route.acme_status = None;
+        } else {
+            return Err(ApiError::NotFound);
+        }
+    }
+
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn request_standalone_acme(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<AcmeStandalonePayload>,
+) -> Result<StatusCode, ApiError> {
+    info!(
+        "ACME standalone request received for host {} (label {:?})",
+        payload.host, payload.acme.label
+    );
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
+    validate_acme_config(&Some(payload.acme.clone()), &state.store.read())
+        .map_err(ApiError::BadRequest)?;
+
+    // Ensure a job entry exists before issuance so the UI can show it even if issuance fails.
+    {
+        let mut store = state.store.write();
+        if let Some(job) = store.acme_standalone.iter_mut().find(|j| j.host == payload.host) {
+            job.acme = payload.acme.clone();
+            job.label = payload.acme.label.clone();
+        } else {
+            store.acme_standalone.push(AcmeStandaloneJob {
+                host: payload.host.clone(),
+                label: payload.acme.label.clone(),
+                acme: payload.acme.clone(),
+                status: Some(AcmeStatus {
+                    state: AcmeState::Pending,
+                    message: None,
+                    not_after: None,
+                }),
+                tls: None,
+            });
+        }
+    }
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
+
+    // Kick off issuance asynchronously so we don't block the admin UI.
+    let host = payload.host.clone();
+    let acme = payload.acme.clone();
+    tokio::spawn(async move {
+        info!("ACME standalone issuance started for {host}");
+        if let Err(err) = renew_standalone_job(state.clone(), host.clone(), Some(acme.clone())).await {
+            warn!("Standalone ACME async job failed for {}: {err:?}", host);
+        }
+        info!("ACME standalone issuance finished for {}", host);
+    });
+
+    info!("ACME standalone request for {} acknowledged (202)", payload.host);
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn list_acme_standalone(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Result<Json<Vec<AcmeStandaloneJob>>, ApiError> {
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
+    let store = state.store.read();
+    Ok(Json(store.acme_standalone.clone()))
+}
+
+async fn renew_acme_standalone(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<AcmeStandaloneRenewPayload>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
+    match renew_standalone_job(state.clone(), payload.host.clone(), None).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(err) => {
+            warn!("Standalone ACME renew failed for {}: {err:?}", payload.host);
+            Err(ApiError::Internal)
+        }
+    }
+}
+
+async fn delete_acme_standalone(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<AcmeStandaloneRenewPayload>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&ctx).map_err(|_| ApiError::Forbidden)?;
+    let removed = {
+        let mut store = state.store.write();
+        let len = store.acme_standalone.len();
+        store.acme_standalone.retain(|j| j.host != payload.host);
+        store.acme_standalone.len() != len
+    };
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn renew_standalone_job(
+    state: AppState,
+    host: String,
+    override_acme: Option<AcmeConfig>,
+) -> anyhow::Result<()> {
+    info!("ACME standalone renew/start for {}", host);
+    let (acme_cfg, label) = {
+        let store = state.store.read();
+        if let Some(job) = store.acme_standalone.iter().find(|j| j.host == host) {
+            (override_acme.unwrap_or_else(|| job.acme.clone()), job.label.clone())
+        } else if let Some(acme) = override_acme.clone() {
+            (acme, None)
+        } else {
+            return Err(anyhow::anyhow!("job not found"));
+        }
+    };
+
+    let tls = obtain_cert(host.clone(), acme_cfg.clone(), state.clone()).await?;
+    let not_after = cert_not_after(tls.cert_path.clone());
+    let cert_name = label.unwrap_or_else(|| host.clone());
+    register_certificate(&state, cert_name, &tls, "acme");
+    {
+        let mut store = state.store.write();
+        if let Some(job) = store.acme_standalone.iter_mut().find(|j| j.host == host) {
+            job.acme = acme_cfg.clone();
+            job.tls = Some(tls.clone());
+            job.status = Some(AcmeStatus {
+                state: AcmeState::Issued,
+                message: None,
+                not_after,
+            });
+        } else {
+            store.acme_standalone.push(AcmeStandaloneJob {
+                host: host.clone(),
+                label: None,
+                acme: acme_cfg.clone(),
+                status: Some(AcmeStatus {
+                    state: AcmeState::Issued,
+                    message: None,
+                    not_after,
+                }),
+                tls: Some(tls.clone()),
+            });
+        }
+    }
+    persist_store(&state).map_err(|_| anyhow::anyhow!("persist failed"))?;
+    info!("ACME standalone renew/start for {} completed", host);
+    Ok(())
 }
 
 async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
@@ -1642,6 +1925,7 @@ impl AcmePayload {
             cache_dir: self.cache_dir,
             challenge: self.challenge,
             provider: self.provider,
+            label: None,
         })
     }
 }
@@ -1721,7 +2005,11 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
                 let needs_cert = route
                     .tls
                     .as_ref()
-                    .map(|t| !FsPath::new(&t.cert_path).exists())
+                    .map(|t| {
+                        let missing = !FsPath::new(&t.cert_path).exists();
+                        let expiring = !is_cert_fresh_enough(&t.cert_path, 30);
+                        missing || expiring
+                    })
                     .unwrap_or(true);
                 if needs_cert {
                     match obtain_cert(route.host.clone(), acme.clone(), state.clone()).await {
@@ -1729,7 +2017,7 @@ async fn ensure_acme_for_listener(state: AppState, listener_id: Uuid) -> anyhow:
                             route.tls = Some(tls);
                             register_certificate(
                                 &state,
-                                route.host.clone(),
+                                acme.label.clone().unwrap_or_else(|| route.host.clone()),
                                 route.tls.as_ref().unwrap(),
                                 "acme",
                             );
@@ -1793,81 +2081,104 @@ async fn obtain_cert(host: String, acme: AcmeConfig, state: AppState) -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("ACME email required"))?;
 
     let tls = tokio::task::spawn_blocking(move || -> anyhow::Result<TlsConfig> {
-        std::fs::create_dir_all(&cache_dir)?;
-        std::fs::create_dir_all(&challenge_dir)?;
+        let mut last_err: Option<anyhow::Error> = None;
 
-        let url = match acme.directory_url.as_deref() {
-            Some(url) if url.contains("staging") => DirectoryUrl::LetsEncryptStaging,
-            Some(url) if url.contains("letsencrypt") => DirectoryUrl::LetsEncrypt,
-            Some(url) => DirectoryUrl::Other(url),
-            None => DirectoryUrl::LetsEncrypt,
-        };
-        let persist = FilePersist::new(&cache_dir);
-        let dir = Directory::from_url(persist, url)?;
-        let acc = dir.account(&email)?;
-        let mut ord_new = acc.new_order(&host, &[])?;
+        for attempt in 0..2 {
+            let issue = || -> anyhow::Result<TlsConfig> {
+                std::fs::create_dir_all(&cache_dir)?;
+                std::fs::create_dir_all(&challenge_dir)?;
 
-        let ord_csr = loop {
-            if let Some(ord_csr) = ord_new.confirm_validations() {
-                break ord_csr;
-            }
+                let url = match acme.directory_url.as_deref() {
+                    Some(url) if url.contains("staging") => DirectoryUrl::LetsEncryptStaging,
+                    Some(url) if url.contains("letsencrypt") => DirectoryUrl::LetsEncrypt,
+                    Some(url) => DirectoryUrl::Other(url),
+                    None => DirectoryUrl::LetsEncrypt,
+                };
+                let persist = FilePersist::new(&cache_dir);
+                let dir = Directory::from_url(persist, url)?;
+                let acc = dir.account(&email)?;
+                let mut ord_new = acc.new_order(&host, &[])?;
 
-            let mut auths = ord_new.authorizations()?;
-            for auth in auths.iter_mut() {
-                match acme.challenge {
-                    AcmeChallenge::Http01 => {
-                        let chall = auth.http_challenge();
-                        let token = chall.http_token();
-                        let proof = chall.http_proof();
-                        let path = FsPath::new(&challenge_dir).join(token);
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::write(&path, proof)?;
-                        chall.validate(5000)?;
+                let ord_csr = loop {
+                    if let Some(ord_csr) = ord_new.confirm_validations() {
+                        break ord_csr;
                     }
-                    AcmeChallenge::Dns01 => {
-                        if let Some(provider_name) = &acme.provider {
-                            let chall = auth.dns_challenge();
-                            let proof = chall.dns_proof();
-                            perform_dns01(provider_name, &host, &proof, &state)?;
-                            // Give DNS a moment to propagate, then validate with a longer window.
-                            thread::sleep(Duration::from_secs(15));
-                            chall.validate(30000)?;
-                        } else {
-                            return Err(anyhow::anyhow!(
-                                "DNS-01 requires provider configuration for {}",
-                                host
-                            ));
+
+                    let mut auths = ord_new.authorizations()?;
+                    for auth in auths.iter_mut() {
+                        match acme.challenge {
+                            AcmeChallenge::Http01 => {
+                                let chall = auth.http_challenge();
+                                let token = chall.http_token();
+                                let proof = chall.http_proof();
+                                let path = FsPath::new(&challenge_dir).join(token);
+                                if let Some(parent) = path.parent() {
+                                    std::fs::create_dir_all(parent)?;
+                                }
+                                std::fs::write(&path, proof)?;
+                                chall.validate(5000)?;
+                            }
+                            AcmeChallenge::Dns01 => {
+                                if let Some(provider_name) = &acme.provider {
+                                    let chall = auth.dns_challenge();
+                                    let proof = chall.dns_proof();
+                                    perform_dns01(provider_name, &host, &proof, &state)?;
+                                    // Give DNS a moment to propagate, then validate with a longer window.
+                                    thread::sleep(Duration::from_secs(15));
+                                    chall.validate(30000)?;
+                                } else {
+                                    return Err(anyhow::anyhow!(
+                                        "DNS-01 requires provider configuration for {}",
+                                        host
+                                    ));
+                                }
+                            }
                         }
+                    }
+
+                    ord_new.refresh()?;
+                    thread::sleep(Duration::from_secs(2));
+                };
+
+                let pkey_pri = create_p384_key();
+                let ord_csr = ord_csr.finalize_pkey(pkey_pri, 5000)?;
+                let cert = ord_csr.download_and_save_cert()?;
+
+                let cert_path = FsPath::new(&cert_dir)
+                    .join(format!("{}.crt", host.replace('*', "_wildcard")))
+                    .to_string_lossy()
+                    .to_string();
+                let key_path = FsPath::new(&cert_dir)
+                    .join(format!("{}.key", host.replace('*', "_wildcard")))
+                    .to_string_lossy()
+                    .to_string();
+                std::fs::create_dir_all(&cert_dir)?;
+                std::fs::write(&cert_path, cert.certificate())?;
+                std::fs::write(&key_path, cert.private_key())?;
+
+                Ok(TlsConfig {
+                    cert_path,
+                    key_path,
+                })
+            };
+
+            match issue() {
+                Ok(tls) => return Ok(tls),
+                Err(err) => {
+                    let msg = err.to_string();
+                    if attempt == 0 && msg.contains("JWS verification error") {
+                        warn!("ACME JWS verification failed; clearing cache at {} and retrying once", cache_dir);
+                        let _ = std::fs::remove_dir_all(&cache_dir);
+                        last_err = Some(err);
+                        continue;
+                    } else {
+                        return Err(err);
                     }
                 }
             }
+        }
 
-            ord_new.refresh()?;
-            thread::sleep(Duration::from_secs(2));
-        };
-
-        let pkey_pri = create_p384_key();
-        let ord_csr = ord_csr.finalize_pkey(pkey_pri, 5000)?;
-        let cert = ord_csr.download_and_save_cert()?;
-
-        let cert_path = FsPath::new(&cert_dir)
-            .join(format!("{}.crt", host.replace('*', "_wildcard")))
-            .to_string_lossy()
-            .to_string();
-        let key_path = FsPath::new(&cert_dir)
-            .join(format!("{}.key", host.replace('*', "_wildcard")))
-            .to_string_lossy()
-            .to_string();
-        std::fs::create_dir_all(&cert_dir)?;
-        std::fs::write(&cert_path, cert.certificate())?;
-        std::fs::write(&key_path, cert.private_key())?;
-
-        Ok(TlsConfig {
-            cert_path,
-            key_path,
-        })
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("ACME failed")))
     })
     .await??;
 
@@ -1893,9 +2204,7 @@ fn perform_dns01(
 
     match provider.provider {
         DnsProvider::Cloudflare => update_cloudflare_dns(provider, host, proof),
-        DnsProvider::Route53 => Err(anyhow::anyhow!(
-            "Route53 automation not implemented yet; use Cloudflare or HTTP-01"
-        )),
+        DnsProvider::Route53 => update_route53_dns(provider, host, proof),
         DnsProvider::Generic => Err(anyhow::anyhow!(
             "Generic DNS provider automation not implemented"
         )),
@@ -1979,6 +2288,80 @@ fn update_cloudflare_dns(
     Ok(())
 }
 
+fn update_route53_dns(
+    provider: &AcmeProviderConfig,
+    host: &str,
+    proof: &str,
+) -> anyhow::Result<()> {
+    use rusoto_core::credential::StaticProvider;
+    use rusoto_core::region::Region;
+    use rusoto_core::request::HttpClient;
+    use rusoto_route53::{
+        Change, ChangeBatch, ChangeResourceRecordSetsRequest, ResourceRecord, ResourceRecordSet,
+        Route53, Route53Client,
+    };
+
+    let access_key = provider
+        .access_key
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Route53 access_key is required"))?;
+    let secret_key = provider
+        .secret_key
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Route53 secret_key is required"))?;
+    let zone_id = provider
+        .zone
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Route53 hosted zone ID is required"))?;
+    let region_name = provider
+        .api_base
+        .clone()
+        .unwrap_or_else(|| "us-east-1".into());
+
+    let wildcard_fixed = host.trim_start_matches("*.");
+    let name = format!(
+        "{}.{}",
+        provider
+            .txt_prefix
+            .clone()
+            .unwrap_or_else(|| "_acme-challenge".into()),
+        wildcard_fixed
+    );
+
+    let region = Region::Custom {
+        name: region_name.clone(),
+        endpoint: "https://route53.amazonaws.com".into(),
+    };
+    let cred = StaticProvider::new_minimal(access_key, secret_key);
+    let client = Route53Client::new_with(HttpClient::new()?, cred, region);
+
+    let rrset = ResourceRecordSet {
+        name: name.clone(),
+        type_: "TXT".into(),
+        ttl: Some(60),
+        resource_records: Some(vec![ResourceRecord {
+            value: format!("\"{}\"", proof),
+        }]),
+        ..Default::default()
+    };
+
+    let req = ChangeResourceRecordSetsRequest {
+        hosted_zone_id: zone_id,
+        change_batch: ChangeBatch {
+            changes: vec![Change {
+                action: "UPSERT".into(),
+                resource_record_set: rrset,
+            }],
+            ..Default::default()
+        },
+    };
+
+    // Run the async client in a lightweight runtime inside the blocking context.
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async { client.change_resource_record_sets(req).await })?;
+    Ok(())
+}
+
 fn resolve_cloudflare_zone_id(
     api_base: &str,
     token: &str,
@@ -2025,6 +2408,17 @@ fn cert_not_after(path: String) -> Option<String> {
     let not_after = parsed.validity().not_after.to_datetime();
     let dt = DateTime::<Utc>::from_timestamp(not_after.unix_timestamp(), not_after.nanosecond())?;
     Some(dt.to_rfc3339())
+}
+
+fn is_cert_fresh_enough(path: &str, days: i64) -> bool {
+    if let Some(na) = cert_not_after(path.to_string()) {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&na) {
+            let dt = dt.with_timezone(&Utc);
+            let cutoff = Utc::now() + chrono::Duration::days(days);
+            return dt > cutoff;
+        }
+    }
+    false
 }
 
 fn register_certificate(state: &AppState, name: String, tls: &TlsConfig, source: &str) {
@@ -3114,10 +3508,25 @@ fn ensure_bootstrap_admin(store: &mut ConfigStore) {
         return;
     }
 
-    let password = std::env::var("BALOR_DEFAULT_ADMIN_PASSWORD").unwrap_or_else(|_| {
-        warn!("BALOR_DEFAULT_ADMIN_PASSWORD not set; using insecure default 'admin'");
-        "admin".to_string()
-    });
+    let password = std::env::var("BALOR_DEFAULT_ADMIN_PASSWORD")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| {
+            let generated = generate_strong_password();
+            let path = bootstrap_secret_path();
+            if let Err(err) = persist_bootstrap_secret(&path, &generated) {
+                warn!(
+                    "Generated bootstrap admin password but failed to persist to {}: {err}",
+                    path.display()
+                );
+            } else {
+                info!(
+                    "Generated bootstrap admin password and wrote it to {} (mode 600). Please rotate and remove after first login.",
+                    path.display()
+                );
+            }
+            generated
+        });
 
     let hash = match hash_password(&password) {
         Ok(h) => h,
@@ -3135,6 +3544,34 @@ fn ensure_bootstrap_admin(store: &mut ConfigStore) {
     };
 
     store.users.insert(record.id, record);
+}
+
+fn generate_strong_password() -> String {
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
+fn bootstrap_secret_path() -> PathBuf {
+    std::env::var("BALOR_BOOTSTRAP_SECRET_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/admin-bootstrap.txt"))
+}
+
+fn persist_bootstrap_secret(path: &PathBuf, password: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("username=admin\npassword={password}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 async fn hydrate_supervisor(state: AppState) -> anyhow::Result<()> {
@@ -3241,6 +3678,31 @@ async fn run_acme_renewal(state: &AppState) {
                     warn!("ACME renewal for listener {id} failed: {err:?}");
                 }
             }
+        }
+    }
+    // Standalone jobs
+    let standalone_hosts: Vec<String> = {
+        let store = state.store.read();
+        store
+            .acme_standalone
+            .iter()
+            .filter(|j| {
+                j.status
+                    .as_ref()
+                    .and_then(|s| s.not_after.as_ref())
+                    .and_then(|na| DateTime::parse_from_rfc3339(na).ok())
+                    .map(|exp| {
+                        let exp_utc = exp.with_timezone(&Utc);
+                        (exp_utc - Utc::now()).num_days() <= 15
+                    })
+                    .unwrap_or(true)
+            })
+            .map(|j| j.host.clone())
+            .collect()
+    };
+    for host in standalone_hosts {
+        if let Err(err) = renew_standalone_job(state.clone(), host.clone(), None).await {
+            warn!("ACME renewal for standalone host failed: {err:?}");
         }
     }
 }

@@ -14,6 +14,7 @@ all: run
 # Build the Yew admin UI (WASM) into admin/dist
 ui:
 	cd admin && trunk build --release
+	rm -rf logs/*
 
 # Serve the UI in dev mode (trunk serve)
 ui-dev:

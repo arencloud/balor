@@ -1,6 +1,6 @@
 [package]
 name = "backend"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -28,6 +28,8 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 argon2 = "0.5.3"
 rand = "0.8.5"
+rusoto_core = "0.48"
+rusoto_route53 = "0.48"
 rand_core = "0.6.4"
 prometheus = "0.13.4"
 futures = "0.3.31"
