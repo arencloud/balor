@@ -152,6 +152,12 @@ struct Upstream {
     enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     healthy: Option<bool>,
+    #[serde(default = "default_weight")]
+    weight: u32,
+}
+
+const fn default_weight() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +220,8 @@ struct UpstreamPayload {
     name: String,
     address: String,
     enabled: bool,
+    #[serde(default = "default_weight")]
+    weight: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2043,6 +2051,7 @@ impl UpstreamPayload {
             address: self.address,
             enabled: self.enabled,
             healthy: None,
+            weight: if self.weight == 0 { 1 } else { self.weight },
         })
     }
 }
@@ -2882,6 +2891,22 @@ impl HttpProxyState {
             return None;
         }
 
+        let weighted_pick = |list: &[Upstream], seed: u64| -> Upstream {
+            let total: u32 = list.iter().map(|u| u.weight.max(1)).sum();
+            if total == 0 {
+                return list[0].clone();
+            }
+            let mut acc = seed % total as u64;
+            for u in list {
+                let w = u.weight.max(1) as u64;
+                if acc < w {
+                    return u.clone();
+                }
+                acc = acc.saturating_sub(w);
+            }
+            list[0].clone()
+        };
+
         match &self.sticky {
             Some(StickyConfig {
                 strategy: StickyStrategy::Cookie,
@@ -2898,11 +2923,8 @@ impl HttpProxyState {
                     }
                 }
 
-                let idx = self.position.fetch_add(1, Ordering::Relaxed) % enabled.len();
-                let upstream = enabled
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_else(|| enabled[0].clone());
+                let seed = self.position.fetch_add(1, Ordering::Relaxed) as u64;
+                let upstream = weighted_pick(&enabled, seed);
 
                 let name = cookie_name.as_deref().unwrap_or("BALOR_STICKY").to_string();
                 let value = upstream.id.to_string();
@@ -2919,16 +2941,16 @@ impl HttpProxyState {
                 let addr = peer.ip();
                 let mut hasher = DefaultHasher::new();
                 Hash::hash(&addr, &mut hasher);
-                let idx = (hasher.finish() as usize) % enabled.len();
-                enabled.get(idx).cloned().map(|u| UpstreamSelection {
-                    upstream: u,
+                let seed = hasher.finish();
+                enabled.get(0).cloned().map(|_| UpstreamSelection {
+                    upstream: weighted_pick(&enabled, seed),
                     set_cookie: None,
                 })
             }
             None => {
-                let idx = self.position.fetch_add(1, Ordering::Relaxed) % enabled.len();
-                enabled.get(idx).cloned().map(|u| UpstreamSelection {
-                    upstream: u,
+                let seed = self.position.fetch_add(1, Ordering::Relaxed) as u64;
+                enabled.get(0).cloned().map(|_| UpstreamSelection {
+                    upstream: weighted_pick(&enabled, seed),
                     set_cookie: None,
                 })
             }
