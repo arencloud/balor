@@ -4,14 +4,17 @@
 
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
+use js_sys::Array;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::f64;
+use serde_yaml;
 use std::collections::HashSet;
+use std::f64;
 use std::{cell::RefCell, rc::Rc};
 use uuid::Uuid;
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::spawn_local;
+use web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, Url};
 use yew::prelude::*;
 
 fn default_true() -> bool {
@@ -213,6 +216,8 @@ struct HostRule {
     host: String,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimitConfig>,
     upstreams: Vec<Upstream>,
     #[serde(default)]
     pool: Option<String>,
@@ -241,6 +246,8 @@ struct Listener {
     sticky: Option<StickyConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acme: Option<AcmeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimitConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -248,6 +255,12 @@ struct UpstreamPayload {
     name: String,
     address: String,
     enabled: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct RateLimitConfig {
+    rps: u32,
+    burst: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -263,6 +276,8 @@ struct HostRulePayload {
     enabled: bool,
     upstreams: Vec<UpstreamPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls: Option<TlsConfig>,
@@ -277,6 +292,8 @@ struct ListenerPayload {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimitConfig>,
     #[serde(default = "default_true")]
     enabled: bool,
     upstreams: Vec<UpstreamPayload>,
@@ -309,6 +326,8 @@ struct HostRuleForm {
     host: String,
     enabled: bool,
     tls_enabled: bool,
+    rate_rps: String,
+    rate_burst: String,
     upstreams_text: String,
     pool: String,
     selected_cert: String,
@@ -327,6 +346,11 @@ struct UpstreamPoolForm {
 struct Stats {
     listener_count: usize,
     active_runtimes: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct TraceSettings {
+    sample_permyriad: u64,
 }
 
 #[wasm_bindgen(start)]
@@ -372,6 +396,17 @@ fn app() -> Html {
     let _log_file_view = use_state(|| None::<(String, String)>);
     let log_files = use_state(Vec::<LogFileInfo>::new);
     let log_file_view = use_state(|| None::<(String, String)>);
+    let bulk_json = use_state(|| String::new());
+    let bulk_status = use_state(StatusLine::clear);
+    let bulk_busy = use_state(|| false);
+    let bulk_format = use_state(|| "json".to_string());
+    let listener_filter = use_state(|| String::new());
+    let listener_page = use_state(|| 1usize);
+    let trace_settings = use_state(|| TraceSettings {
+        sample_permyriad: 10_000,
+    });
+    let trace_status = use_state(StatusLine::clear);
+    let trace_loading = use_state(|| false);
 
     let handle_error = {
         let status = status.clone();
@@ -406,6 +441,9 @@ fn app() -> Html {
         let logs_state = logs.clone();
         let log_files_state = log_files.clone();
         let latency_rows_tab = latency_rows.clone();
+        let trace_settings_state = trace_settings.clone();
+        let trace_status_state = trace_status.clone();
+        let trace_loading_state = trace_loading.clone();
         use_effect_with((*tab).clone(), move |current_tab: &Tab| {
             let metrics_text = metrics_text.clone();
             let metrics_rows = metrics_rows.clone();
@@ -482,6 +520,9 @@ fn app() -> Html {
                     }
                 });
             } else if *current_tab == Tab::Logs {
+                let trace_settings = trace_settings_state.clone();
+                let trace_status = trace_status_state.clone();
+                let trace_loading = trace_loading_state.clone();
                 spawn_local(async move {
                     match api_logs().await {
                         Ok(entries) => logs_state.set(entries),
@@ -491,6 +532,15 @@ fn app() -> Html {
                         Ok(files) => log_files_state.set(files),
                         Err(err) => handle_error(err),
                     }
+                    trace_loading.set(true);
+                    match api_trace_settings().await {
+                        Ok(cfg) => {
+                            trace_settings.set(cfg);
+                            trace_status.set(StatusLine::clear());
+                        }
+                        Err(err) => trace_status.set(StatusLine::error(err)),
+                    }
+                    trace_loading.set(false);
                 });
             }
             || ()
@@ -859,7 +909,14 @@ fn app() -> Html {
                 })
         })
         .collect();
-    let acme_job_cards: Vec<(Option<Uuid>, String, Option<String>, Option<AcmeConfig>, Option<AcmeStatus>, Option<TlsConfig>)> = {
+    let acme_job_cards: Vec<(
+        Option<Uuid>,
+        String,
+        Option<String>,
+        Option<AcmeConfig>,
+        Option<AcmeStatus>,
+        Option<TlsConfig>,
+    )> = {
         let mut cards = Vec::new();
         for (lid, _lname, route) in acme_routes.clone() {
             cards.push((
@@ -884,18 +941,19 @@ fn app() -> Html {
         cards
     };
     let acme_schedule_form = (*acme_schedule).clone();
-    let acme_hosts_for_schedule: Vec<String> = if let Ok(id) = Uuid::parse_str(&acme_schedule_form.listener) {
-        listeners
-            .iter()
-            .find(|l| l.id == id)
-            .and_then(|l| l.host_routes.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| r.host)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let acme_hosts_for_schedule: Vec<String> =
+        if let Ok(id) = Uuid::parse_str(&acme_schedule_form.listener) {
+            listeners
+                .iter()
+                .find(|l| l.id == id)
+                .and_then(|l| l.host_routes.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.host)
+                .collect()
+        } else {
+            Vec::new()
+        };
     let acme_standalone_form = (*acme_standalone).clone();
 
     html! {
@@ -1445,30 +1503,108 @@ fn app() -> Html {
                                                                                         }) }
                                                                                     </select>
                                                                                 </label>
-                                                                                </>
-                                                                            }
-                                                                        } else {
-                                                                            html!{
-                                                                                <label class="field" style="grid-column: span 12;">
-                                                                                    <span>{"Pool"}</span>
-                                                                                    <select
-                                                                                        onchange={{
+                                                                                <label class="field" style="grid-column: span 3;">
+                                                                                    <span>{"Rate limit RPS"}</span>
+                                                                                    <input
+                                                                                        type="number"
+                                                                                        min="0"
+                                                                                        value={rule.rate_rps.clone()}
+                                                                                        oninput={{
                                                                                             let form = form.clone();
-                                                                                            Callback::from(move |e: Event| {
+                                                                                            Callback::from(move |e: InputEvent| {
                                                                                                 let mut next = (*form).clone();
                                                                                                 if let Some(r) = next.host_rules.get_mut(idx) {
-                                                                                                    r.pool = select_value(&e).unwrap_or_default();
+                                                                                                    r.rate_rps = event_value(&e);
                                                                                                 }
                                                                                                 form.set(next);
                                                                                             })
                                                                                         }}
-                                                                                    >
-                                                                                        <option value="" selected={rule.pool.is_empty()}>{"Select pool (required)"}</option>
-                                                                                        { for pools.iter().map(|p| {
-                                                                                            html!{ <option value={p.name.clone()} selected={rule.pool == p.name}>{&p.name}</option> }
-                                                                                        })}
-                                                                                    </select>
+                                                                                        placeholder="e.g. 50"
+                                                                                    />
                                                                                 </label>
+                                                                                <label class="field" style="grid-column: span 3;">
+                                                                                    <span>{"Burst"}</span>
+                                                                                    <input
+                                                                                        type="number"
+                                                                                        min="0"
+                                                                                        value={rule.rate_burst.clone()}
+                                                                                        oninput={{
+                                                                                            let form = form.clone();
+                                                                                            Callback::from(move |e: InputEvent| {
+                                                                                                let mut next = (*form).clone();
+                                                                                                if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                    r.rate_burst = event_value(&e);
+                                                                                                }
+                                                                                                form.set(next);
+                                                                                            })
+                                                                                        }}
+                                                                                        placeholder="e.g. 100"
+                                                                                    />
+                                                                                </label>
+                                                                                </>
+                                                                            }
+                                                                        } else {
+                                                                            html!{
+                                                                                <>
+                                                                                    <label class="field" style="grid-column: span 12;">
+                                                                                        <span>{"Pool"}</span>
+                                                                                        <select
+                                                                                            onchange={{
+                                                                                                let form = form.clone();
+                                                                                                Callback::from(move |e: Event| {
+                                                                                                    let mut next = (*form).clone();
+                                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                        r.pool = select_value(&e).unwrap_or_default();
+                                                                                                    }
+                                                                                                    form.set(next);
+                                                                                                })
+                                                                                            }}
+                                                                                        >
+                                                                                            <option value="" selected={rule.pool.is_empty()}>{"Select pool (required)"}</option>
+                                                                                            { for pools.iter().map(|p| {
+                                                                                                html!{ <option value={p.name.clone()} selected={rule.pool == p.name}>{&p.name}</option> }
+                                                                                            })}
+                                                                                        </select>
+                                                                                    </label>
+                                                                                    <label class="field" style="grid-column: span 3;">
+                                                                                        <span>{"Rate limit RPS"}</span>
+                                                                                        <input
+                                                                                            type="number"
+                                                                                            min="0"
+                                                                                            value={rule.rate_rps.clone()}
+                                                                                            oninput={{
+                                                                                                let form = form.clone();
+                                                                                                Callback::from(move |e: InputEvent| {
+                                                                                                    let mut next = (*form).clone();
+                                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                        r.rate_rps = event_value(&e);
+                                                                                                    }
+                                                                                                    form.set(next);
+                                                                                                })
+                                                                                            }}
+                                                                                            placeholder="e.g. 50"
+                                                                                        />
+                                                                                    </label>
+                                                                                    <label class="field" style="grid-column: span 3;">
+                                                                                        <span>{"Burst"}</span>
+                                                                                        <input
+                                                                                            type="number"
+                                                                                            min="0"
+                                                                                            value={rule.rate_burst.clone()}
+                                                                                            oninput={{
+                                                                                                let form = form.clone();
+                                                                                                Callback::from(move |e: InputEvent| {
+                                                                                                    let mut next = (*form).clone();
+                                                                                                    if let Some(r) = next.host_rules.get_mut(idx) {
+                                                                                                        r.rate_burst = event_value(&e);
+                                                                                                    }
+                                                                                                    form.set(next);
+                                                                                                })
+                                                                                            }}
+                                                                                            placeholder="e.g. 100"
+                                                                                        />
+                                                                                    </label>
+                                                                                </>
                                                                             }
                                                                         }
                                                                     }
@@ -1511,24 +1647,277 @@ fn app() -> Html {
 
                             <section class="panel">
                                 <div class="panel-head">
+                                    <div>
+                                        <p class="eyebrow">{"Bulk import / export"}</p>
+                                        <h2>{"Share listener configs"}</h2>
+                                        <p class="muted">{"Export listeners as JSON or YAML, edit offline, then import to recreate them."}</p>
+                                    </div>
+                                    <StatusBadge status={(*bulk_status).clone()} />
+                                </div>
+                                <div class="pill-row wrap" style="margin-bottom:12px;">
+                                    <span class="pill pill-ghost">{"Format"}</span>
+                                    {
+                                        for ["json","yaml"].iter().map(|fmt| {
+                                            let bulk_format = bulk_format.clone();
+                                            let active = *fmt == bulk_format.as_str();
+                                            html!{
+                                                <button type="button" class={classes!("ghost", if active { "pill-on" } else { "" })} onclick={{
+                                                    let bulk_format = bulk_format.clone();
+                                                    let fmt = (*fmt).to_string();
+                                                    Callback::from(move |_| bulk_format.set(fmt.clone()))
+                                                }}>{fmt.to_uppercase()}</button>
+                                            }
+                                        })
+                                    }
+                                    <button type="button" class="ghost" disabled={*bulk_busy} onclick={{
+                                        let bulk_json = bulk_json.clone();
+                                        let bulk_status = bulk_status.clone();
+                                        let bulk_busy = bulk_busy.clone();
+                                        let bulk_format = bulk_format.clone();
+                                        let handle_error = handle_error.clone();
+                                        Callback::from(move |_| {
+                                            let bulk_json = bulk_json.clone();
+                                            let bulk_status = bulk_status.clone();
+                                            let bulk_busy = bulk_busy.clone();
+                                            let bulk_format = bulk_format.clone();
+                                            let handle_error = handle_error.clone();
+                                            spawn_local(async move {
+                                                bulk_busy.set(true);
+                                                match api_listeners().await {
+                                                    Ok(list) => {
+                                                        let serialized: Result<String, String> = if bulk_format.as_str() == "yaml" {
+                                                            serde_yaml::to_string(&list).map_err(|e| e.to_string())
+                                                        } else {
+                                                            serde_json::to_string_pretty(&list).map_err(|e| e.to_string())
+                                                        };
+                                                        match serialized {
+                                                            Ok(text) => {
+                                                                bulk_json.set(text);
+                                                                bulk_status.set(StatusLine::success("Exported current listeners"));
+                                                            }
+                                                            Err(e) => bulk_status.set(StatusLine::error(format!("Serialize failed: {e}"))),
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        handle_error(err.clone());
+                                                        bulk_status.set(StatusLine::error(err));
+                                                    }
+                                                }
+                                                bulk_busy.set(false);
+                                            });
+                                        })
+                                    }}>{"Export"}</button>
+                                    <button type="button" class="ghost" disabled={*bulk_busy} onclick={{
+                                        let bulk_format = bulk_format.clone();
+                                        let handle_error = handle_error.clone();
+                                        Callback::from(move |_| {
+                                            let fmt = bulk_format.as_str().to_string();
+                                            let handle_error = handle_error.clone();
+                                            spawn_local(async move {
+                                                match api_listeners().await {
+                                                    Ok(list) => {
+                                                        if fmt == "yaml" {
+                                                            match serde_yaml::to_string(&list) {
+                                                                Ok(body) => download_text_file("listeners.yaml", &body, "application/x-yaml"),
+                                                                Err(e) => handle_error(format!("Download failed: {e}")),
+                                                            }
+                                                        } else {
+                                                            match serde_json::to_string_pretty(&list) {
+                                                                Ok(body) => download_text_file("listeners.json", &body, "application/json"),
+                                                                Err(e) => handle_error(format!("Download failed: {e}")),
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(err) => handle_error(err),
+                                                }
+                                            });
+                                        })
+                                    }}>{"Download file"}</button>
+                                    <button type="button" class="primary" disabled={*bulk_busy} onclick={{
+                                        let bulk_json = bulk_json.clone();
+                                        let bulk_status = bulk_status.clone();
+                                        let bulk_busy = bulk_busy.clone();
+                                        let listeners = listeners.clone();
+                                        let handle_error = handle_error.clone();
+                                        Callback::from(move |_| {
+                                            let bulk_json = (*bulk_json).clone();
+                                            let bulk_status = bulk_status.clone();
+                                            let bulk_busy = bulk_busy.clone();
+                                            let listeners = listeners.clone();
+                                            let handle_error = handle_error.clone();
+                                            spawn_local(async move {
+                                                bulk_busy.set(true);
+                                                let payloads: Result<Vec<ListenerPayload>, String> = (|| {
+                                                    if bulk_json.trim().is_empty() {
+                                                        return Err("Paste listener JSON before importing".into());
+                                                    }
+                                                    if let Ok(p) = serde_json::from_str::<Vec<ListenerPayload>>(&bulk_json) {
+                                                        return Ok(p);
+                                                    }
+                                                    if let Ok(p) = serde_yaml::from_str::<Vec<ListenerPayload>>(&bulk_json) {
+                                                        return Ok(p);
+                                                    }
+                                                    if let Ok(list) = serde_json::from_str::<Vec<Listener>>(&bulk_json) {
+                                                        let mut payloads = Vec::new();
+                                                        for l in list {
+                                                            let form = ListenerForm::from_listener(&l);
+                                                            payloads.push(form.to_payload()?);
+                                                        }
+                                                        return Ok(payloads);
+                                                    }
+                                                    if let Ok(list) = serde_yaml::from_str::<Vec<Listener>>(&bulk_json) {
+                                                        let mut payloads = Vec::new();
+                                                        for l in list {
+                                                            let form = ListenerForm::from_listener(&l);
+                                                            payloads.push(form.to_payload()?);
+                                                        }
+                                                        return Ok(payloads);
+                                                    }
+                                                    Err("Could not parse payload. Expect an array of listeners (JSON or YAML).".into())
+                                                })();
+
+                                                match payloads {
+                                                    Err(msg) => {
+                                                        bulk_status.set(StatusLine::error(msg));
+                                                        bulk_busy.set(false);
+                                                    }
+                                                    Ok(payloads) => {
+                                                        let mut names = HashSet::new();
+                                                        let mut binds = HashSet::new();
+                                                        for p in &payloads {
+                                                            if !names.insert(p.name.clone()) {
+                                                                bulk_status.set(StatusLine::error(format!("Duplicate listener name in import: {}", p.name)));
+                                                                bulk_busy.set(false);
+                                                                return;
+                                                            }
+                                                            if !binds.insert(p.listen.clone()) {
+                                                                bulk_status.set(StatusLine::error(format!("Duplicate listen address in import: {}", p.listen)));
+                                                                bulk_busy.set(false);
+                                                                return;
+                                                            }
+                                                        }
+                                                        if let Some(dup) = payloads.iter().find(|p| listeners.iter().any(|e| e.name == p.name || e.listen == p.listen)) {
+                                                            bulk_status.set(StatusLine::error(format!("Listener already exists (name or bind): {}", dup.name)));
+                                                            bulk_busy.set(false);
+                                                            return;
+                                                        }
+                                                        let mut imported = 0usize;
+                                                        for payload in payloads {
+                                                            match api_create_listener(payload).await {
+                                                                Ok(_) => imported += 1,
+                                                                Err(err) => {
+                                                                    handle_error(err.clone());
+                                                                    bulk_status.set(StatusLine::error(format!("Stopped at listener {imported}: {err}")));
+                                                                    bulk_busy.set(false);
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                        match api_listeners().await {
+                                                            Ok(updated) => listeners.set(updated),
+                                                            Err(err) => handle_error(err),
+                                                        }
+                                                        bulk_status.set(StatusLine::success(format!("Imported {imported} listener(s)")));
+                                                        bulk_busy.set(false);
+                                                    }
+                                                }
+                                            });
+                                        })
+                                    }}>{"Import"}</button>
+                                    <span class="pill pill-ghost">{ if *bulk_busy { "Working..." } else { "Paste array of listeners and click Import" } }</span>
+                                </div>
+                                <label class="field span-3">
+                                    <span>{"Buffer (JSON or YAML)"}</span>
+                                    <textarea
+                                        rows="6"
+                                        placeholder="[ { \"name\": \"edge\", ... } ]"
+                                        value={(*bulk_json).clone()}
+                                        oninput={{
+                                            let bulk_json = bulk_json.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                bulk_json.set(textarea_value(&e));
+                                            })
+                                        }}
+                                    />
+                                </label>
+                            </section>
+
+                            <section class="panel">
+                                <div class="panel-head">
                                     <h2>{"Active Listeners"}</h2>
                                     { if *loading { html!{<span class="pill pill-ghost">{"Loading..."}</span>} } else { html!{} } }
                                 </div>
+                                <div class="pill-row wrap" style="margin-bottom:12px;">
+                                    <label class="field" style="min-width:220px;">
+                                        <span class="muted">{"Search listeners"}</span>
+                                        <input
+                                            placeholder="Filter by name or host"
+                                            value={listener_filter.as_str().to_string()}
+                                            oninput={{
+                                                let listener_filter = listener_filter.clone();
+                                                let listener_page = listener_page.clone();
+                                                Callback::from(move |e: InputEvent| {
+                                                    listener_filter.set(event_value(&e));
+                                                    listener_page.set(1);
+                                                })
+                                            }}
+                                        />
+                                    </label>
+                                    <span class="pill pill-ghost">{ format!("Total: {}", listeners.len()) }</span>
+                                </div>
                                 {
-                                    if listeners.is_empty() {
-                                        html!{<p class="muted">{"No listeners yet. Add one above to start balancing traffic."}</p>}
-                                    } else {
+                                    {
+                                        let filter = listener_filter.as_str().to_lowercase();
+                                        let filtered: Vec<_> = listeners.iter().cloned().filter(|l| {
+                                            if filter.is_empty() { return true; }
+                                            let mut haystack = l.name.to_lowercase();
+                                            haystack.push_str(&l.listen.to_lowercase());
+                                            if let Some(routes) = &l.host_routes {
+                                                for r in routes {
+                                                    haystack.push_str(&r.host.to_lowercase());
+                                                }
+                                            }
+                                            haystack.contains(&filter)
+                                        }).collect();
+                                        let page_size = 6usize;
+                                        let total_pages = (filtered.len() + page_size - 1).max(1) / page_size;
+                                        let current = listener_page.max(1).min(total_pages);
+                                        let start = (current - 1) * page_size;
+                                        let slice = filtered.iter().skip(start).take(page_size).cloned().collect::<Vec<_>>();
                                         html!{
-                                            <div class="cards">
-                                                { for listeners.iter().map(|l| render_listener(l.clone(), on_delete.clone(), {
-                                                    let form = form.clone();
-                                                    let editing = editing.clone();
-                                                    Callback::from(move |listener: Listener| {
-                                                        form.set(ListenerForm::from_listener(&listener));
-                                                        editing.set(Some(listener.id));
-                                                    })
-                                                })) }
-                                            </div>
+                                            <>
+                                                <div class="pill-row wrap" style="margin-bottom:12px;">
+                                                    <span class="pill pill-ghost">{ format!("Page {}/{}", current, total_pages.max(1)) }</span>
+                                                    <button type="button" class="ghost" disabled={current <= 1} onclick={{
+                                                        let listener_page = listener_page.clone();
+                                                        Callback::from(move |_| listener_page.set(current.saturating_sub(1)))
+                                                    }}>{"Prev"}</button>
+                                                    <button type="button" class="ghost" disabled={current >= total_pages} onclick={{
+                                                        let listener_page = listener_page.clone();
+                                                        let total = total_pages;
+                                                        Callback::from(move |_| listener_page.set((current + 1).min(total)))
+                                                    }}>{"Next"}</button>
+                                                    <span class="pill pill-ghost">{ format!("Showing {} of {}", slice.len(), filtered.len()) }</span>
+                                                </div>
+                                                {
+                                                    if filtered.is_empty() {
+                                                        html!{<p class="muted">{"No listeners match your search."}</p>}
+                                                    } else {
+                                                        html!{
+                                                            <div class="cards">
+                                                                { for slice.iter().map(|l| render_listener(l.clone(), on_delete.clone(), {
+                                                                    let form = form.clone();
+                                                                    let editing = editing.clone();
+                                                                    Callback::from(move |listener: Listener| {
+                                                                        form.set(ListenerForm::from_listener(&listener));
+                                                                        editing.set(Some(listener.id));
+                                                                    })
+                                                                })) }
+                                                            </div>
+                                                        }
+                                                    }
+                                                }
+                                            </>
                                         }
                                     }
                                 }
@@ -1686,6 +2075,78 @@ fn app() -> Html {
                                             <option value="error" selected={log_filter.as_str() == "error"}>{"Error"}</option>
                                         </select>
                                     </div>
+                                </div>
+                                <div class="pill-row wrap" style="margin-bottom:12px;">
+                                    <span class="pill pill-ghost">{"Trace sampling"}</span>
+                                    {
+                                        for [100,50,10].iter().map(|pct| {
+                                            let trace_settings = trace_settings.clone();
+                                            let trace_status = trace_status.clone();
+                                            let handle_error = handle_error.clone();
+                                            let trace_loading = trace_loading.clone();
+                                            html!{
+                                                <button type="button" class="ghost" disabled={*trace_loading} onclick={{
+                                                    let trace_settings = trace_settings.clone();
+                                                    let trace_status = trace_status.clone();
+                                                    let handle_error = handle_error.clone();
+                                                    let trace_loading = trace_loading.clone();
+                                                    let val = (*pct as u64) * 100;
+                                                    Callback::from(move |_| {
+                                                        let trace_settings = trace_settings.clone();
+                                                        let trace_status = trace_status.clone();
+                                                        let handle_error = handle_error.clone();
+                                                        let trace_loading = trace_loading.clone();
+                                                        spawn_local(async move {
+                                                            trace_loading.set(true);
+                                                            if let Err(err) = api_set_trace_settings(val).await {
+                                                                handle_error(err);
+                                                            } else {
+                                                                trace_settings.set(TraceSettings{ sample_permyriad: val });
+                                                                trace_status.set(StatusLine::success("Sampling updated"));
+                                                            }
+                                                            trace_loading.set(false);
+                                                        });
+                                                    })
+                                                }}>{format!("{pct}%")}</button>
+                                            }
+                                        })
+                                    }
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max="100"
+                                        value={(trace_settings.sample_permyriad / 100).to_string()}
+                                        oninput={{
+                                            let trace_settings = trace_settings.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let pct = event_value(&e).parse::<u64>().unwrap_or(100);
+                                                trace_settings.set(TraceSettings{ sample_permyriad: (pct.min(100))*100 });
+                                            })
+                                        }}
+                                    />
+                                    <button type="button" class="primary" disabled={*trace_loading} onclick={{
+                                        let trace_settings = trace_settings.clone();
+                                        let trace_status = trace_status.clone();
+                                        let handle_error = handle_error.clone();
+                                        let trace_loading = trace_loading.clone();
+                                        Callback::from(move |_| {
+                                            let trace_settings = trace_settings.clone();
+                                            let trace_status = trace_status.clone();
+                                            let handle_error = handle_error.clone();
+                                            let trace_loading = trace_loading.clone();
+                                            spawn_local(async move {
+                                                trace_loading.set(true);
+                                                let val = trace_settings.sample_permyriad;
+                                                match api_set_trace_settings(val).await {
+                                                    Ok(_) => trace_status.set(StatusLine::success(format!("Sampling set to {:.1}%", val as f64 / 100.0))),
+                                                    Err(err) => handle_error(err),
+                                                }
+                                                trace_loading.set(false);
+                                            });
+                                        })
+                                    }}>{"Apply sampling"}</button>
+                                    <span class="pill pill-ghost">{ format!("Current {:.1}%", trace_settings.sample_permyriad as f64 / 100.0) }</span>
+                                    <StatusBadge status={(*trace_status).clone()} />
                                 </div>
                                 <div class="log-list">
                                     { render_logs(&logs, log_filter.as_str()) }
@@ -3247,6 +3708,8 @@ struct ListenerForm {
     name: String,
     listen: String,
     protocol: Protocol,
+    rate_rps: String,
+    rate_burst: String,
     enabled: bool,
     upstreams_text: String,
     tcp_pool: String,
@@ -3333,6 +3796,8 @@ impl Default for ListenerForm {
             name: String::new(),
             listen: String::from("0.0.0.0:9000"),
             protocol: Protocol::Http,
+            rate_rps: String::new(),
+            rate_burst: String::new(),
             enabled: true,
             upstreams_text: String::from("http://127.0.0.1:7000"),
             tcp_pool: String::new(),
@@ -3367,6 +3832,8 @@ impl Default for HostRuleForm {
             host: String::new(),
             enabled: true,
             tls_enabled: false,
+            rate_rps: String::new(),
+            rate_burst: String::new(),
             upstreams_text: String::from("http://127.0.0.1:7000"),
             pool: String::new(),
             selected_cert: String::new(),
@@ -3488,6 +3955,30 @@ impl Default for UserForm {
 }
 
 impl ListenerForm {
+    fn parse_rate(rps: &str, burst: &str) -> Result<Option<RateLimitConfig>, String> {
+        let rps_trim = rps.trim();
+        let burst_trim = burst.trim();
+        if rps_trim.is_empty() && burst_trim.is_empty() {
+            return Ok(None);
+        }
+        let rps_val: u32 = rps_trim
+            .parse()
+            .map_err(|_| "Rate limit RPS must be a number".to_string())?;
+        if rps_val == 0 {
+            return Ok(None);
+        }
+        let burst_val: u32 = if burst_trim.is_empty() {
+            rps_val
+        } else {
+            burst_trim
+                .parse()
+                .map_err(|_| "Burst must be a number".to_string())?
+        };
+        Ok(Some(RateLimitConfig {
+            rps: rps_val,
+            burst: burst_val.max(rps_val),
+        }))
+    }
     fn from_listener(listener: &Listener) -> Self {
         let upstreams_text = listener
             .upstreams
@@ -3549,6 +4040,16 @@ impl ListenerForm {
                     host: r.host,
                     enabled: r.enabled,
                     tls_enabled: r.tls.is_some() || r.acme.is_some(),
+                    rate_rps: r
+                        .rate_limit
+                        .as_ref()
+                        .map(|rl| rl.rps.to_string())
+                        .unwrap_or_default(),
+                    rate_burst: r
+                        .rate_limit
+                        .as_ref()
+                        .map(|rl| rl.burst.to_string())
+                        .unwrap_or_default(),
                     upstreams_text: r
                         .upstreams
                         .into_iter()
@@ -3593,6 +4094,16 @@ impl ListenerForm {
             acme_directory,
             acme_challenge,
             acme_provider,
+            rate_rps: listener
+                .rate_limit
+                .as_ref()
+                .map(|r| r.rps.to_string())
+                .unwrap_or_default(),
+            rate_burst: listener
+                .rate_limit
+                .as_ref()
+                .map(|r| r.burst.to_string())
+                .unwrap_or_default(),
             sticky,
             cookie_name,
             enabled: listener.enabled,
@@ -3643,6 +4154,7 @@ impl ListenerForm {
                         host: rule.host.trim().to_lowercase(),
                         enabled: rule.enabled,
                         upstreams,
+                        rate_limit: ListenerForm::parse_rate(&rule.rate_rps, &rule.rate_burst)?,
                         pool: (!rule.pool.trim().is_empty()).then(|| rule.pool.clone()),
                         tls: if !cert_path.trim().is_empty()
                             && !key_path.trim().is_empty()
@@ -3737,6 +4249,7 @@ impl ListenerForm {
             name: self.name.clone(),
             listen: self.listen.clone(),
             protocol: self.protocol.clone(),
+            rate_limit: ListenerForm::parse_rate(&self.rate_rps, &self.rate_burst)?,
             enabled: self.enabled,
             upstreams,
             host_routes,
@@ -4033,6 +4546,36 @@ fn with_auth(req: gloo_net::http::RequestBuilder) -> gloo_net::http::RequestBuil
     }
 }
 
+fn download_text_file(name: &str, content: &str, mime: &str) {
+    if let Some(window) = web_sys::window() {
+        if let Some(document) = window.document() {
+            let parts = Array::new();
+            parts.push(&JsValue::from_str(content));
+            let bag = BlobPropertyBag::new();
+            bag.set_type(mime);
+            if let Ok(blob) = Blob::new_with_str_sequence_and_options(&parts, &bag) {
+                if let Ok(url) = Url::create_object_url_with_blob(&blob) {
+                    if let Ok(element) = document.create_element("a") {
+                        if let Ok(anchor) = element.dyn_into::<HtmlAnchorElement>() {
+                            anchor.set_href(&url);
+                            anchor.set_download(name);
+                            if let Some(body) = document.body() {
+                                let _ = anchor.set_attribute("style", "display:none;");
+                                let _ = body.append_child(&anchor);
+                                anchor.click();
+                                let _ = body.remove_child(&anchor);
+                            } else {
+                                anchor.click();
+                            }
+                            let _ = Url::revoke_object_url(&url);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn api_listeners() -> Result<Vec<Listener>, String> {
     let resp = with_auth(Request::get("/api/listeners"))
         .send()
@@ -4086,6 +4629,33 @@ async fn api_metrics() -> Result<String, String> {
             .await
             .unwrap_or_else(|_| "<unable to read body>".into());
         Err(format!("{status}: {body}"))
+    }
+}
+
+async fn api_trace_settings() -> Result<TraceSettings, String> {
+    let resp = with_auth(Request::get("/api/logging"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    parse_json_response::<TraceSettings>(resp).await
+}
+
+async fn api_set_trace_settings(sample_permyriad: u64) -> Result<(), String> {
+    let payload = TraceSettings { sample_permyriad };
+    let resp = with_auth(Request::put("/api/logging"))
+        .json(&payload)
+        .map_err(|e| format!("serialize: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ))
     }
 }
 
@@ -4310,7 +4880,8 @@ async fn api_acme_unschedule(listener: Uuid, host: String) -> Result<(), String>
         listener: Uuid,
         host: String,
     }
-    let body = serde_json::to_string(&UnschedulePayload { listener, host }).map_err(|e| e.to_string())?;
+    let body =
+        serde_json::to_string(&UnschedulePayload { listener, host }).map_err(|e| e.to_string())?;
     let resp = with_auth(Request::post("/api/acme/unschedule"))
         .header("Content-Type", "application/json")
         .body(body)
