@@ -203,6 +203,8 @@ struct Upstream {
     enabled: bool,
     #[serde(default)]
     healthy: Option<bool>,
+    #[serde(default)]
+    weight: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -255,12 +257,18 @@ struct UpstreamPayload {
     name: String,
     address: String,
     enabled: bool,
+    #[serde(default = "default_weight")]
+    weight: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct RateLimitConfig {
     rps: u32,
     burst: u32,
+}
+
+const fn default_weight() -> u32 {
+    1
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1329,7 +1337,7 @@ fn app() -> Html {
                                                                             next.upstreams_text = pool
                                                                                 .upstreams
                                                                                 .iter()
-                                                                                .map(|u| format!("{}={}", u.name, u.address))
+                                                                            .map(|u| format!("{}={} {}", u.name, u.address, u.weight.unwrap_or(1)))
                                                                                 .collect::<Vec<_>>()
                                                                                 .join("\n");
                                                                         }
@@ -4283,10 +4291,17 @@ fn to_upstream_payload(
     _protocol: &Protocol,
 ) -> Result<UpstreamPayload, String> {
     let trimmed = line.trim();
-    let (name, address) = if let Some((name, addr)) = trimmed.split_once('=') {
-        (name.trim().to_string(), addr.trim().to_string())
+    let (name, address, weight) = if let Some((name, rest)) = trimmed.split_once('=') {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        let addr = parts.get(0).unwrap_or(&"").trim().to_string();
+        let weight = if let Some(w) = parts.get(1) {
+            w.parse::<u32>().unwrap_or(1)
+        } else {
+            1
+        };
+        (name.trim().to_string(), addr, weight)
     } else {
-        (format!("upstream-{}", index + 1), trimmed.to_string())
+        (format!("upstream-{}", index + 1), trimmed.to_string(), 1)
     };
 
     if address.is_empty() {
@@ -4297,6 +4312,7 @@ fn to_upstream_payload(
         name,
         address,
         enabled: true,
+        weight,
     })
 }
 
