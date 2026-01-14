@@ -68,6 +68,11 @@ Environment knobs:
 - `BALOR_ADMIN_TOKEN` (optional) – alternative bearer token that always maps to `admin` role (bypasses password).
 - `BALOR_BOOTSTRAP_SECRET_FILE` (default `data/admin-bootstrap.txt`) – when no users exist and no `BALOR_DEFAULT_ADMIN_PASSWORD` is set, a strong password is generated and written here (mode 600) for first login; rotate and delete after use.
 
+## Development / CI checks
+- `make fmt` – format workspace.
+- `make backend` / `make admin-check` – quick checks for backend/admin.
+- `make ci` – fmt --check, clippy (all targets/features), backend tests.
+
 ## API sketch
 - `GET /api/health` – service heartbeat.
 - `GET /api/stats` – listener/task counts.
