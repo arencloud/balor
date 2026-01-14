@@ -7,7 +7,7 @@ SHELL := /bin/bash
 ADMIN_DIST ?= admin/dist
 BALOR_DEFAULT_ADMIN_PASSWORD ?= admin
 
-.PHONY: all ui ui-dev backend admin-check run fmt clean
+.PHONY: all ui ui-dev backend admin-check run fmt clean ci
 
 all: run
 
@@ -42,3 +42,9 @@ run: ui
 clean:
 	cargo clean
 	rm -rf admin/dist admin/pkg admin/target
+
+# CI helpers: fmt check, clippy, tests (backend)
+ci:
+	cargo fmt --all -- --check
+	cargo clippy --all-targets --all-features -- -D warnings
+	cargo test -p backend

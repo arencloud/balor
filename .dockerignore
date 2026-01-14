@@ -1,0 +1,12 @@
+target
+admin/dist
+admin/pkg
+admin/target
+data/logs
+data/*.jsonl
+data/balor_state.json
+.git
+.gitignore
+*.swp
+node_modules
+Cargo.lock

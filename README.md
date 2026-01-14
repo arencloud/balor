@@ -68,6 +68,15 @@ Environment knobs:
 - `BALOR_ADMIN_TOKEN` (optional) – alternative bearer token that always maps to `admin` role (bypasses password).
 - `BALOR_BOOTSTRAP_SECRET_FILE` (default `data/admin-bootstrap.txt`) – when no users exist and no `BALOR_DEFAULT_ADMIN_PASSWORD` is set, a strong password is generated and written here (mode 600) for first login; rotate and delete after use.
 
+## Development / CI checks
+- `make fmt` – format workspace.
+- `make backend` / `make admin-check` – quick checks for backend/admin.
+- `make ci` – fmt --check, clippy (all targets/features), backend tests.
+
+## Packaging
+- Docker: `docker build -t balor:latest .` (multi-stage, bundles admin/dist + backend). Run with `-e BALOR_ADMIN_DIST=/app/admin/dist -p 9443:9443`.
+- Homebrew (tap example under `packaging/balor.rb`): provides a formula to build UI + backend from source; set `BALOR_ADMIN_DIST` to the installed `dist` path (see caveats in the formula).
+
 ## API sketch
 - `GET /api/health` – service heartbeat.
 - `GET /api/stats` – listener/task counts.
@@ -75,6 +84,7 @@ Environment knobs:
 - `POST /api/listeners` – create listener. HTTP listeners rely on host-based routes: `{ name, listen, protocol: "http", rate_limit?, host_routes: [{ host, pool, rate_limit?, tls?, acme? }], upstreams: [...] }` (TCP uses `upstreams`, typically hydrated from a selected pool in the UI). Pools are referenced by name. `rate_limit` is `{ rps, burst }` and enforces 429 + `Retry-After` on overage.
 - `GET /api/listeners/{id}` – fetch a listener.
 - `PUT /api/listeners/{id}` – update a listener.
+- `POST /api/listeners/{id}/drain` – gracefully drain and disable a listener before delete/update (stops runtime, keeps config).
 - `DELETE /api/listeners/{id}` – remove a listener and stop its runtime.
 - `GET/POST/DELETE /api/pools` – manage reusable upstream pools (attach to host routes).
 - `GET/POST/PUT/DELETE /api/acme/providers` – manage DNS-01 provider profiles (Cloudflare, Route53, generic).
@@ -117,4 +127,5 @@ Environment knobs:
 - ✅ Admin console port/TLS controls: default bind `0.0.0.0:9443`, UI control to change port and pick a console cert (restart required)
 - ✅ Rate limiting: per-listener and per-host-route token-bucket limits (RPS + burst) with 429 + `Retry-After` on overage
 - ✅ ACME automation: HTTP-01 + Cloudflare/Route53/Generic (webhook) DNS-01 with periodic renewal and backoff retries. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
+- ✅ Listener bind flexibility: any valid `host:port` accepted in the UI/API for HTTP/TCP listeners; backend enforces socket-addr validity only.
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes

@@ -764,15 +764,29 @@ enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self {
-            ApiError::NotFound => StatusCode::NOT_FOUND,
-            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::Forbidden => StatusCode::FORBIDDEN,
-            ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        #[derive(Serialize)]
+        struct ErrorBody<'a> {
+            error: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            hint: Option<&'a str>,
+        }
+
+        let (status, hint) = match &self {
+            ApiError::NotFound => (StatusCode::NOT_FOUND, Some("Resource not found")),
+            ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, Some("Check request payload")),
+            ApiError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                Some("Admin/operator permission required"),
+            ),
+            ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, Some("Try again later")),
         };
 
         let message = self.to_string();
-        (status, Json(serde_json::json!({ "error": message }))).into_response()
+        let body = ErrorBody {
+            error: &message,
+            hint,
+        };
+        (status, Json(body)).into_response()
     }
 }
 
@@ -844,6 +858,7 @@ async fn main() -> anyhow::Result<()> {
                         .put(update_listener)
                         .delete(delete_listener),
                 )
+                .route("/listeners/:id/drain", post(drain_listener))
                 .route("/users", get(list_users).post(create_user))
                 .route("/users/:id", put(update_user).delete(delete_user))
                 .route(
@@ -1887,6 +1902,26 @@ async fn delete_listener(
     state.supervisor.remove(&id).await;
     persist_store(&state).map_err(|_| ApiError::Internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[axum::debug_handler]
+async fn drain_listener(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_operator(&ctx)?;
+    {
+        let mut store = state.store.write();
+        if let Some(listener) = store.listeners.get_mut(&id) {
+            listener.enabled = false;
+        } else {
+            return Err(ApiError::NotFound);
+        }
+    }
+    state.supervisor.remove(&id).await;
+    persist_store(&state).map_err(|_| ApiError::Internal)?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 impl ListenerPayload {
