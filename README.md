@@ -8,7 +8,7 @@ Rust-native L4/L7 load balancer with an Axum admin API and a Yew (WASM) control 
 
 **Author:** Eduard Gevorkyan (egevorky@arencloud.com)  
 **License:** Apache 2.0  
-**Current version:** UI 0.1.1 • API 0.1.1 • build `dev`
+**Current version:** UI 0.1.2 • API 0.1.2 • build `dev`
 
 ## Architecture
 
@@ -72,7 +72,7 @@ Environment knobs:
 - `GET /api/health` – service heartbeat.
 - `GET /api/stats` – listener/task counts.
 - `GET /api/listeners` – list configured listeners.
-- `POST /api/listeners` – create listener. HTTP listeners rely on host-based routes: `{ name, listen, protocol: "http", host_routes: [{ host, pool, tls?, acme? }], upstreams: [...] }` (TCP uses `upstreams`, typically hydrated from a selected pool in the UI). Pools are referenced by name.
+- `POST /api/listeners` – create listener. HTTP listeners rely on host-based routes: `{ name, listen, protocol: "http", rate_limit?, host_routes: [{ host, pool, rate_limit?, tls?, acme? }], upstreams: [...] }` (TCP uses `upstreams`, typically hydrated from a selected pool in the UI). Pools are referenced by name. `rate_limit` is `{ rps, burst }` and enforces 429 + `Retry-After` on overage.
 - `GET /api/listeners/{id}` – fetch a listener.
 - `PUT /api/listeners/{id}` – update a listener.
 - `DELETE /api/listeners/{id}` – remove a listener and stop its runtime.
@@ -115,5 +115,6 @@ Environment knobs:
 - ✅ Metrics tab now includes latency quantiles (p50/p95/p99) derived from Prometheus buckets with quick visual cards
 - ✅ Logs tab (admin-only): live buffer view, level filter, and JSONL download/preview from the backend log store (retention + rotation)
 - ✅ Admin console port/TLS controls: default bind `0.0.0.0:9443`, UI control to change port and pick a console cert (restart required)
+- ✅ Rate limiting: per-listener and per-host-route token-bucket limits (RPS + burst) with 429 + `Retry-After` on overage
 - ✅ ACME automation: HTTP-01 + Cloudflare/Route53/Generic (webhook) DNS-01 with periodic renewal and backoff retries. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes

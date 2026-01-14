@@ -22,6 +22,11 @@ use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{SinkExt, StreamExt};
+use governor::{
+    clock::{Clock, DefaultClock},
+    state::{direct::NotKeyed, InMemoryState},
+    Quota, RateLimiter,
+};
 use hyper_util::rt::TokioIo;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -44,9 +49,10 @@ use std::{
     hash::{Hash, Hasher},
     io::Write,
     net::SocketAddr,
+    num::NonZeroU32,
     path::{Path as FsPath, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -64,9 +70,9 @@ use tokio_util::sync::CancellationToken;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
-    trace::TraceLayer,
+    trace::{DefaultMakeSpan, TraceLayer},
 };
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 use tracing_subscriber::{
     layer::Context as TraceContext, layer::SubscriberExt, registry::LookupSpan,
     util::SubscriberInitExt, Layer,
@@ -154,12 +160,22 @@ struct UpstreamPool {
     upstreams: Vec<Upstream>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RateLimitConfig {
+    #[serde(default)]
+    rps: u32,
+    #[serde(default)]
+    burst: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ListenerConfig {
     id: Uuid,
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimitConfig>,
     #[serde(default = "default_enabled")]
     enabled: bool,
     upstreams: Vec<Upstream>,
@@ -178,6 +194,8 @@ struct ListenerPayload {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimitConfig>,
     #[serde(default = "default_enabled")]
     enabled: bool,
     upstreams: Vec<UpstreamPayload>,
@@ -211,6 +229,8 @@ struct HostRulePayload {
     #[serde(default = "default_enabled")]
     enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls: Option<TlsPayload>,
@@ -226,6 +246,8 @@ struct HostRule {
     upstreams: Vec<Upstream>,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimitConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,7 +298,7 @@ struct AcmeStatus {
     attempts: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AcmeState {
     Pending,
@@ -292,6 +314,35 @@ impl AcmePayload {
 
 fn default_acme_challenge() -> AcmeChallenge {
     AcmeChallenge::Http01
+}
+
+type HttpLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+fn build_limiter(cfg: &RateLimitConfig) -> Option<Arc<HttpLimiter>> {
+    let rps = NonZeroU32::new(cfg.rps)?;
+    let burst = NonZeroU32::new(cfg.burst.max(1)).unwrap_or(rps);
+    let quota = Quota::per_second(rps).allow_burst(burst);
+    Some(Arc::new(HttpLimiter::direct(quota)))
+}
+
+fn should_renew_acme(status: Option<&AcmeStatus>) -> bool {
+    match status {
+        None => true,
+        Some(st) => match st.state {
+            AcmeState::Issued => st
+                .not_after
+                .as_ref()
+                .and_then(|na| DateTime::parse_from_rfc3339(na).ok())
+                .map(|exp| (exp.with_timezone(&Utc) - Utc::now()).num_days() <= 20)
+                .unwrap_or(false),
+            _ => st
+                .next_retry
+                .as_ref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|dt| dt.with_timezone(&Utc) <= Utc::now())
+                .unwrap_or(true),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +403,12 @@ struct ConfigStore {
     certificates: Vec<CertificateBundle>,
     #[serde(default)]
     pools: Vec<UpstreamPool>,
+    #[serde(default = "default_trace_sample")]
+    trace_sample: u64,
+}
+
+fn default_trace_sample() -> u64 {
+    10_000
 }
 
 struct AppContext {
@@ -362,6 +419,7 @@ struct AppContext {
     admin_token: Option<String>,
     sessions: RwLock<HashMap<String, Session>>,
     metrics: Arc<Metrics>,
+    trace_sample: Arc<AtomicU64>,
 }
 
 type AppState = Arc<AppContext>;
@@ -382,6 +440,11 @@ struct BalancerHandle {
 struct StatsResponse {
     listener_count: usize,
     active_runtimes: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct TraceSettings {
+    sample_permyriad: u64,
 }
 
 #[derive(Clone)]
@@ -650,6 +713,28 @@ where
     }
 }
 
+#[derive(Clone)]
+struct SamplingMakeSpan {
+    sample: Arc<AtomicU64>,
+}
+
+impl SamplingMakeSpan {
+    fn new(sample: Arc<AtomicU64>) -> Self {
+        Self { sample }
+    }
+}
+
+impl<B> tower_http::trace::MakeSpan<B> for SamplingMakeSpan {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
+        let permyriad = self.sample.load(Ordering::Relaxed).min(10_000);
+        if permyriad >= 10_000 || thread_rng().gen_range(0..10_000) < permyriad {
+            DefaultMakeSpan::new().make_span(request)
+        } else {
+            tracing::Span::none()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LogoutPayload {
     token: String,
@@ -717,6 +802,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let admin_token = std::env::var("BALOR_ADMIN_TOKEN").ok();
 
+    let trace_sample = Arc::new(AtomicU64::new(initial_store.trace_sample));
+
     let state: AppState = Arc::new(AppContext {
         store: RwLock::new(initial_store),
         supervisor,
@@ -725,6 +812,7 @@ async fn main() -> anyhow::Result<()> {
         admin_token,
         sessions: RwLock::new(HashMap::new()),
         metrics,
+        trace_sample,
     });
 
     let admin_dist = resolve_admin_dist();
@@ -775,6 +863,10 @@ async fn main() -> anyhow::Result<()> {
                 .route("/pools/:name", delete(delete_pool))
                 .route("/certs", get(list_certs).post(upload_cert))
                 .route("/certs/:name", get(get_cert).delete(delete_cert))
+                .route(
+                    "/logging",
+                    get(get_trace_settings).put(update_trace_settings),
+                )
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     admin_auth_guard,
@@ -802,7 +894,10 @@ async fn main() -> anyhow::Result<()> {
                 .allow_methods(Any)
                 .allow_origin(Any),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(SamplingMakeSpan::new(state.trace_sample.clone())),
+        )
         .with_state(state.clone());
 
     let console_cfg = current_console_config(&state);
@@ -1036,7 +1131,11 @@ async fn request_standalone_acme(
     // Ensure a job entry exists before issuance so the UI can show it even if issuance fails.
     {
         let mut store = state.store.write();
-        if let Some(job) = store.acme_standalone.iter_mut().find(|j| j.host == payload.host) {
+        if let Some(job) = store
+            .acme_standalone
+            .iter_mut()
+            .find(|j| j.host == payload.host)
+        {
             job.acme = payload.acme.clone();
             job.label = payload.acme.label.clone();
         } else {
@@ -1062,13 +1161,18 @@ async fn request_standalone_acme(
     let acme = payload.acme.clone();
     tokio::spawn(async move {
         info!("ACME standalone issuance started for {host}");
-        if let Err(err) = renew_standalone_job(state.clone(), host.clone(), Some(acme.clone())).await {
+        if let Err(err) =
+            renew_standalone_job(state.clone(), host.clone(), Some(acme.clone())).await
+        {
             warn!("Standalone ACME async job failed for {}: {err:?}", host);
         }
         info!("ACME standalone issuance finished for {}", host);
     });
 
-    info!("ACME standalone request for {} acknowledged (202)", payload.host);
+    info!(
+        "ACME standalone request for {} acknowledged (202)",
+        payload.host
+    );
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -1124,7 +1228,10 @@ async fn renew_standalone_job(
     let (acme_cfg, label) = {
         let store = state.store.read();
         if let Some(job) = store.acme_standalone.iter().find(|j| j.host == host) {
-            (override_acme.unwrap_or_else(|| job.acme.clone()), job.label.clone())
+            (
+                override_acme.unwrap_or_else(|| job.acme.clone()),
+                job.label.clone(),
+            )
         } else if let Some(acme) = override_acme.clone() {
             (acme, None)
         } else {
@@ -1206,6 +1313,27 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         active_runtimes: state.supervisor.active_runtimes(),
     };
     Json(response)
+}
+
+async fn get_trace_settings(State(state): State<AppState>) -> Json<TraceSettings> {
+    let sample = state.trace_sample.load(Ordering::Relaxed);
+    Json(TraceSettings {
+        sample_permyriad: sample,
+    })
+}
+
+async fn update_trace_settings(
+    State(state): State<AppState>,
+    Json(payload): Json<TraceSettings>,
+) -> Result<StatusCode, ApiError> {
+    let sample = payload.sample_permyriad.min(10_000);
+    state.trace_sample.store(sample, Ordering::Relaxed);
+    {
+        let mut store = state.store.write();
+        store.trace_sample = sample;
+        persist_store(&state).map_err(|_| ApiError::Internal)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_logs(
@@ -1767,6 +1895,7 @@ impl ListenerPayload {
             name,
             listen,
             protocol,
+            rate_limit,
             enabled,
             upstreams,
             host_routes,
@@ -1856,6 +1985,7 @@ impl ListenerPayload {
             name,
             listen,
             protocol,
+            rate_limit,
             enabled,
             upstreams,
             host_routes,
@@ -1888,6 +2018,7 @@ impl HostRulePayload {
             host,
             upstreams,
             enabled,
+            rate_limit,
             pool,
             tls,
             acme,
@@ -1918,6 +2049,7 @@ impl HostRulePayload {
             host: host.to_lowercase(),
             upstreams,
             enabled,
+            rate_limit,
             pool: pool.clone(),
             tls: tls.map(|t| t.into_config()).transpose()?,
             acme: acme.map(|a| a.into_config()).transpose()?,
@@ -2456,7 +2588,9 @@ fn update_generic_dns(
         host.trim_start_matches("*."),
     );
     let agent = ureq::agent();
-    let mut req = agent.post(&api_base).set("Content-Type", "application/json");
+    let mut req = agent
+        .post(&api_base)
+        .set("Content-Type", "application/json");
     if let Some(token) = provider.api_token.as_ref() {
         req = req.set("Authorization", &format!("Bearer {token}"));
     }
@@ -2624,6 +2758,8 @@ struct HttpProxyState {
     health: Arc<RwLock<HashMap<Uuid, bool>>>,
     sticky: Option<StickyConfig>,
     metrics: Arc<Metrics>,
+    listener_limiter: Option<Arc<HttpLimiter>>,
+    route_limiters: HashMap<String, Arc<HttpLimiter>>,
 }
 
 impl HttpProxyState {
@@ -2634,7 +2770,15 @@ impl HttpProxyState {
         health: Arc<RwLock<HashMap<Uuid, bool>>>,
         sticky: Option<StickyConfig>,
         metrics: Arc<Metrics>,
+        rate_limit: Option<RateLimitConfig>,
     ) -> Self {
+        let listener_limiter = rate_limit.as_ref().and_then(build_limiter);
+        let mut route_limiters = HashMap::new();
+        for r in &host_routes {
+            if let Some(cfg) = r.rate_limit.as_ref().and_then(build_limiter) {
+                route_limiters.insert(r.host.to_lowercase(), cfg);
+            }
+        }
         Self {
             listener_id,
             upstreams: Arc::new(upstreams),
@@ -2644,9 +2788,32 @@ impl HttpProxyState {
             health,
             sticky,
             metrics,
+            listener_limiter,
+            route_limiters,
         }
     }
 
+    fn check_rate_limit(&self, host: Option<&str>) -> Option<Response<Body>> {
+        let limiter: Option<Arc<HttpLimiter>> = host
+            .and_then(|h| self.route_limiters.get(&h.to_lowercase()).cloned())
+            .or_else(|| self.listener_limiter.clone());
+
+        if let Some(lim) = limiter {
+            if let Err(not_until) = lim.check() {
+                let retry = not_until
+                    .wait_time_from(DefaultClock::default().now())
+                    .as_secs()
+                    .max(1);
+                let mut builder = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
+                builder = builder.header("retry-after", retry.to_string());
+                let resp = builder
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| Response::new(Body::empty()));
+                return Some(resp);
+            }
+        }
+        None
+    }
     fn next_upstream(&self, req: &Request<Body>, peer: &SocketAddr) -> Option<UpstreamSelection> {
         let health = self.health.read();
         let host = req
@@ -2757,6 +2924,7 @@ async fn run_http_listener(
         health,
         config.sticky.clone(),
         metrics.clone(),
+        config.rate_limit.clone(),
     );
 
     let router = Router::new().fallback(proxy_http).with_state(state);
@@ -2902,6 +3070,16 @@ async fn proxy_http(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
+    let host_for_limit = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.to_lowercase())
+        .map(|h| h.split(':').next().unwrap_or("").to_string());
+    if let Some(resp) = state.check_rate_limit(host_for_limit.as_deref()) {
+        return Ok(resp);
+    }
+
     let path_for_acme = request.uri().path().to_string();
     if let Some(resp) = try_acme_challenge(&path_for_acme).await {
         return Ok(resp);
@@ -3779,18 +3957,13 @@ async fn run_acme_renewal(state: &AppState) {
             let mut needs = false;
             if let Some(routes) = cfg.host_routes.as_ref() {
                 for route in routes {
-                    if route.acme.is_some() {
-                        if route
-                            .acme_status
-                            .as_ref()
-                            .and_then(|s| s.not_after.as_ref())
-                            .and_then(|na| DateTime::parse_from_rfc3339(na).ok())
-                            .map(|exp| {
-                                let exp_utc = exp.with_timezone(&Utc);
-                                (exp_utc - Utc::now()).num_days() <= 15
-                            })
-                            .unwrap_or(true)
-                        {
+                    if let Some(acme) = route.acme.as_ref() {
+                        if should_renew_acme(route.acme_status.as_ref()) {
+                            trace!(
+                                "ACME renewal scheduled for route {} ({:?})",
+                                route.host,
+                                acme.provider
+                            );
                             needs = true;
                             break;
                         }
@@ -3810,26 +3983,7 @@ async fn run_acme_renewal(state: &AppState) {
         store
             .acme_standalone
             .iter()
-            .filter(|j| {
-                let overdue = j
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.next_retry.as_ref())
-                    .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-                    .map(|dt| dt.with_timezone(&Utc) <= Utc::now())
-                    .unwrap_or(true);
-                let expiring = j
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.not_after.as_ref())
-                    .and_then(|na| DateTime::parse_from_rfc3339(na).ok())
-                    .map(|exp| {
-                        let exp_utc = exp.with_timezone(&Utc);
-                        (exp_utc - Utc::now()).num_days() <= 15
-                    })
-                    .unwrap_or(true);
-                overdue || expiring
-            })
+            .filter(|j| should_renew_acme(j.status.as_ref()))
             .map(|j| j.host.clone())
             .collect()
     };
