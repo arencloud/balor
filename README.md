@@ -75,6 +75,7 @@ Environment knobs:
 - `POST /api/listeners` – create listener. HTTP listeners rely on host-based routes: `{ name, listen, protocol: "http", rate_limit?, host_routes: [{ host, pool, rate_limit?, tls?, acme? }], upstreams: [...] }` (TCP uses `upstreams`, typically hydrated from a selected pool in the UI). Pools are referenced by name. `rate_limit` is `{ rps, burst }` and enforces 429 + `Retry-After` on overage.
 - `GET /api/listeners/{id}` – fetch a listener.
 - `PUT /api/listeners/{id}` – update a listener.
+- `POST /api/listeners/{id}/drain` – gracefully drain and disable a listener before delete/update (stops runtime, keeps config).
 - `DELETE /api/listeners/{id}` – remove a listener and stop its runtime.
 - `GET/POST/DELETE /api/pools` – manage reusable upstream pools (attach to host routes).
 - `GET/POST/PUT/DELETE /api/acme/providers` – manage DNS-01 provider profiles (Cloudflare, Route53, generic).
