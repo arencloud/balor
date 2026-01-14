@@ -73,6 +73,10 @@ Environment knobs:
 - `make backend` / `make admin-check` – quick checks for backend/admin.
 - `make ci` – fmt --check, clippy (all targets/features), backend tests.
 
+## Packaging
+- Docker: `docker build -t balor:latest .` (multi-stage, bundles admin/dist + backend). Run with `-e BALOR_ADMIN_DIST=/app/admin/dist -p 9443:9443`.
+- Homebrew (tap example under `packaging/balor.rb`): provides a formula to build UI + backend from source; set `BALOR_ADMIN_DIST` to the installed `dist` path (see caveats in the formula).
+
 ## API sketch
 - `GET /api/health` – service heartbeat.
 - `GET /api/stats` – listener/task counts.
