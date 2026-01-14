@@ -237,6 +237,8 @@ struct Listener {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    health_probe: Option<HealthProbePayload>,
     #[serde(default = "default_true")]
     enabled: bool,
     upstreams: Vec<Upstream>,
@@ -277,6 +279,14 @@ struct UpstreamPoolPayload {
     upstreams: Vec<UpstreamPayload>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct HealthProbePayload {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct HostRulePayload {
     host: String,
@@ -300,6 +310,8 @@ struct ListenerPayload {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    health_probe: Option<HealthProbePayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rate_limit: Option<RateLimitConfig>,
     #[serde(default = "default_true")]
@@ -1269,6 +1281,44 @@ fn app() -> Html {
                                             <option value="tcp" selected={form.protocol == Protocol::Tcp}>{"TCP (L4)"}</option>
                                         </select>
                                     </label>
+                                    {
+                                        if form.protocol == Protocol::Http {
+                                            html!{
+                                                <>
+                                                    <label class="field">
+                                                        <span>{"Health check path"}</span>
+                                                        <input
+                                                            value={form.health_path.clone()}
+                                                            oninput={{
+                                                                let form = form.clone();
+                                                                Callback::from(move |e: InputEvent| {
+                                                                    let mut next = (*form).clone();
+                                                                    next.health_path = event_value(&e);
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                            placeholder="/health"
+                                                        />
+                                                    </label>
+                                                    <label class="field span-12">
+                                                        <span>{"Health check headers (optional, one per line: Key: Value)"}</span>
+                                                        <textarea
+                                                            value={form.health_headers.clone()}
+                                                            oninput={{
+                                                                let form = form.clone();
+                                                                Callback::from(move |e: InputEvent| {
+                                                                    let mut next = (*form).clone();
+                                                                    next.health_headers = textarea_value(&e);
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                            placeholder={"User-Agent: Balor-Health\nHost: example.com"}
+                                                        />
+                                                    </label>
+                                                </>
+                                            }
+                                        } else { html!{} }
+                                    }
                                     <label class="field">
                                         <span>{"Session affinity"}</span>
                                         <select
@@ -3716,6 +3766,8 @@ struct ListenerForm {
     name: String,
     listen: String,
     protocol: Protocol,
+    health_path: String,
+    health_headers: String,
     rate_rps: String,
     rate_burst: String,
     enabled: bool,
@@ -3804,6 +3856,8 @@ impl Default for ListenerForm {
             name: String::new(),
             listen: String::from("0.0.0.0:9000"),
             protocol: Protocol::Http,
+            health_path: "/health".into(),
+            health_headers: String::new(),
             rate_rps: String::new(),
             rate_burst: String::new(),
             enabled: true,
@@ -4090,6 +4144,22 @@ impl ListenerForm {
             name: listener.name.clone(),
             listen: listener.listen.clone(),
             protocol: listener.protocol.clone(),
+            health_path: listener
+                .health_probe
+                .as_ref()
+                .and_then(|p| p.path.clone())
+                .unwrap_or_else(|| "/health".into()),
+            health_headers: listener
+                .health_probe
+                .as_ref()
+                .map(|p| {
+                    p.headers
+                        .iter()
+                        .map(|(k, v)| format!("{k}: {v}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
             upstreams_text,
             tcp_pool: String::new(),
             host_rules,
@@ -4199,6 +4269,24 @@ impl ListenerForm {
             );
         }
 
+        let health_probe = if self.protocol == Protocol::Http {
+            let headers: Vec<(String, String)> = self
+                .health_headers
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|line| {
+                    line.split_once(':')
+                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect();
+            Some(HealthProbePayload {
+                path: Some(self.health_path.trim().to_string()),
+                headers,
+            })
+        } else {
+            None
+        };
+
         let tls = if self.tls_enabled && self.protocol == Protocol::Http {
             if self.acme_enabled {
                 return Err("Choose either ACME automation or a certificate, not both".into());
@@ -4257,6 +4345,7 @@ impl ListenerForm {
             name: self.name.clone(),
             listen: self.listen.clone(),
             protocol: self.protocol.clone(),
+            health_probe,
             rate_limit: ListenerForm::parse_rate(&self.rate_rps, &self.rate_burst)?,
             enabled: self.enabled,
             upstreams,

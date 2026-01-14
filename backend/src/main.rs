@@ -181,6 +181,8 @@ struct ListenerConfig {
     listen: String,
     protocol: Protocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    health_probe: Option<HealthProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     rate_limit: Option<RateLimitConfig>,
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -200,6 +202,8 @@ struct ListenerPayload {
     name: String,
     listen: String,
     protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    health_probe: Option<HealthProbe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rate_limit: Option<RateLimitConfig>,
     #[serde(default = "default_enabled")]
@@ -222,6 +226,14 @@ struct UpstreamPayload {
     enabled: bool,
     #[serde(default = "default_weight")]
     weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HealthProbe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1938,6 +1950,7 @@ impl ListenerPayload {
             name,
             listen,
             protocol,
+            health_probe,
             rate_limit,
             enabled,
             upstreams,
@@ -2028,6 +2041,7 @@ impl ListenerPayload {
             name,
             listen,
             protocol,
+            health_probe,
             rate_limit,
             enabled,
             upstreams,
@@ -4067,7 +4081,16 @@ async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
         }
         for upstream in all_upstreams {
             let ok = match listener.protocol {
-                Protocol::Http => check_http(client, &ensure_http_scheme(&upstream.address)).await,
+                Protocol::Http => {
+                    let probe = listener.health_probe.clone().unwrap_or_default();
+                    check_http(
+                        client,
+                        &ensure_http_scheme(&upstream.address),
+                        probe.path.clone(),
+                        probe.headers.clone(),
+                    )
+                    .await
+                }
                 Protocol::Tcp => check_tcp(&upstream.address).await,
             };
             state.health.write().insert(upstream.id, ok);
@@ -4075,8 +4098,19 @@ async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
     }
 }
 
-async fn check_http(client: &reqwest::Client, url: &str) -> bool {
-    let fut = client.get(url).timeout(Duration::from_secs(2)).send();
+async fn check_http(
+    client: &reqwest::Client,
+    base: &str,
+    path: Option<String>,
+    headers: Vec<(String, String)>,
+) -> bool {
+    let path = path.unwrap_or_else(|| "/".to_string());
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let mut req = client.get(&url);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let fut = req.timeout(Duration::from_secs(2)).send();
     match fut.await {
         Ok(resp) => resp.status().is_success(),
         Err(err) => {
