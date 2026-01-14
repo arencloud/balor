@@ -285,6 +285,8 @@ struct HealthProbePayload {
     path: Option<String>,
     #[serde(default)]
     headers: Vec<(String, String)>,
+    #[serde(default)]
+    script: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1313,6 +1315,21 @@ fn app() -> Html {
                                                                 })
                                                             }}
                                                             placeholder={"User-Agent: Balor-Health\nHost: example.com"}
+                                                        />
+                                                    </label>
+                                                    <label class="field span-12">
+                                                        <span>{"Health check script (optional, runs instead of HTTP probe; env TARGET/PROTO set)"}</span>
+                                                        <textarea
+                                                            value={form.health_script.clone()}
+                                                            oninput={{
+                                                                let form = form.clone();
+                                                                Callback::from(move |e: InputEvent| {
+                                                                    let mut next = (*form).clone();
+                                                                    next.health_script = textarea_value(&e);
+                                                                    form.set(next);
+                                                                })
+                                                            }}
+                                                            placeholder={"curl -fsSL \"$BALOR_HEALTH_TARGET\" -o /dev/null"}
                                                         />
                                                     </label>
                                                 </>
@@ -3768,6 +3785,7 @@ struct ListenerForm {
     protocol: Protocol,
     health_path: String,
     health_headers: String,
+    health_script: String,
     rate_rps: String,
     rate_burst: String,
     enabled: bool,
@@ -3858,6 +3876,7 @@ impl Default for ListenerForm {
             protocol: Protocol::Http,
             health_path: "/health".into(),
             health_headers: String::new(),
+            health_script: String::new(),
             rate_rps: String::new(),
             rate_burst: String::new(),
             enabled: true,
@@ -4160,6 +4179,11 @@ impl ListenerForm {
                         .join("\n")
                 })
                 .unwrap_or_default(),
+            health_script: listener
+                .health_probe
+                .as_ref()
+                .and_then(|p| p.script.clone())
+                .unwrap_or_default(),
             upstreams_text,
             tcp_pool: String::new(),
             host_rules,
@@ -4282,6 +4306,7 @@ impl ListenerForm {
             Some(HealthProbePayload {
                 path: Some(self.health_path.trim().to_string()),
                 headers,
+                script: (!self.health_script.trim().is_empty()).then(|| self.health_script.clone()),
             })
         } else {
             None

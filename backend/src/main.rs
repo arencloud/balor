@@ -62,6 +62,7 @@ use tokio::task::JoinSet;
 use tokio::{
     fs, io,
     net::{TcpListener, TcpStream},
+    process::Command,
     task::JoinHandle,
     time,
 };
@@ -234,6 +235,8 @@ struct HealthProbe {
     path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     headers: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    script: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4083,15 +4086,29 @@ async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
             let ok = match listener.protocol {
                 Protocol::Http => {
                     let probe = listener.health_probe.clone().unwrap_or_default();
-                    check_http(
-                        client,
-                        &ensure_http_scheme(&upstream.address),
-                        probe.path.clone(),
-                        probe.headers.clone(),
-                    )
-                    .await
+                    if let Some(script) = probe.script.clone() {
+                        run_health_script(&script, &upstream.address, "http").await
+                    } else {
+                        check_http(
+                            client,
+                            &ensure_http_scheme(&upstream.address),
+                            probe.path.clone(),
+                            probe.headers.clone(),
+                        )
+                        .await
+                    }
                 }
-                Protocol::Tcp => check_tcp(&upstream.address).await,
+                Protocol::Tcp => {
+                    if let Some(probe) = listener
+                        .health_probe
+                        .as_ref()
+                        .and_then(|p| p.script.clone())
+                    {
+                        run_health_script(&probe, &upstream.address, "tcp").await
+                    } else {
+                        check_tcp(&upstream.address).await
+                    }
+                }
             };
             state.health.write().insert(upstream.id, ok);
         }
@@ -4129,6 +4146,32 @@ async fn check_tcp(addr: &str) -> bool {
         }
         Err(_) => {
             warn!("TCP health check timed out for {addr}");
+            false
+        }
+    }
+}
+
+async fn run_health_script(script: &str, target: &str, protocol: &str) -> bool {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(script);
+    cmd.env("BALOR_HEALTH_TARGET", target);
+    cmd.env("BALOR_HEALTH_PROTO", protocol);
+    cmd.kill_on_drop(true);
+    match time::timeout(Duration::from_secs(5), cmd.status()).await {
+        Ok(Ok(status)) => {
+            if status.success() {
+                true
+            } else {
+                warn!("Health script exited non-zero for {target}: {status}");
+                false
+            }
+        }
+        Ok(Err(err)) => {
+            warn!("Health script failed for {target}: {err}");
+            false
+        }
+        Err(_) => {
+            warn!("Health script timed out for {target}");
             false
         }
     }
