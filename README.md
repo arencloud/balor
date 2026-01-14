@@ -123,4 +123,5 @@ Environment knobs:
 - ✅ Admin console port/TLS controls: default bind `0.0.0.0:9443`, UI control to change port and pick a console cert (restart required)
 - ✅ Rate limiting: per-listener and per-host-route token-bucket limits (RPS + burst) with 429 + `Retry-After` on overage
 - ✅ ACME automation: HTTP-01 + Cloudflare/Route53/Generic (webhook) DNS-01 with periodic renewal and backoff retries. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
+- ✅ Listener bind flexibility: any valid `host:port` accepted in the UI/API for HTTP/TCP listeners; backend enforces socket-addr validity only.
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes
