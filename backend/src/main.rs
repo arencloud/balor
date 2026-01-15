@@ -63,7 +63,7 @@ use tokio::{
     fs, io,
     net::{TcpListener, TcpStream},
     process::Command,
-    task::JoinHandle,
+    task::{spawn_blocking, JoinHandle},
     time,
 };
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Role as WsRole, WebSocketStream};
@@ -1371,15 +1371,31 @@ async fn update_trace_settings(
         ));
     }
     state.trace_sample.store(sample, Ordering::Relaxed);
-    let persist_result = {
+    let store_path = state.state_path.clone();
+    let snapshot = {
         let mut store = state.store.write();
         store.trace_sample = sample;
-        persist_store(&state)
+        store.clone()
     };
-    if let Err(err) = persist_result {
-        warn!("failed to persist trace settings: {err}");
-        return Err(ApiError::Internal);
-    }
+    // Persist asynchronously to avoid blocking the core runtime.
+    let res = spawn_blocking(move || {
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&store_path, json)
+    })
+    .await
+    .map_err(|e| {
+        warn!("trace persist task join error: {e}");
+        ApiError::Internal
+    })?
+    .map_err(|e| {
+        warn!("failed to persist trace settings: {e}");
+        ApiError::Internal
+    })?;
+    let _ = res;
     Ok(StatusCode::NO_CONTENT)
 }
 
