@@ -62,6 +62,7 @@ use tokio::task::JoinSet;
 use tokio::{
     fs, io,
     net::{TcpListener, TcpStream},
+    process::Command,
     task::JoinHandle,
     time,
 };
@@ -152,6 +153,12 @@ struct Upstream {
     enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     healthy: Option<bool>,
+    #[serde(default = "default_weight")]
+    weight: u32,
+}
+
+const fn default_weight() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +182,8 @@ struct ListenerConfig {
     listen: String,
     protocol: Protocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    health_probe: Option<HealthProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     rate_limit: Option<RateLimitConfig>,
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -195,6 +204,8 @@ struct ListenerPayload {
     listen: String,
     protocol: Protocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    health_probe: Option<HealthProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     rate_limit: Option<RateLimitConfig>,
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -214,6 +225,18 @@ struct UpstreamPayload {
     name: String,
     address: String,
     enabled: bool,
+    #[serde(default = "default_weight")]
+    weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HealthProbe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    headers: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    script: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1930,6 +1953,7 @@ impl ListenerPayload {
             name,
             listen,
             protocol,
+            health_probe,
             rate_limit,
             enabled,
             upstreams,
@@ -2020,6 +2044,7 @@ impl ListenerPayload {
             name,
             listen,
             protocol,
+            health_probe,
             rate_limit,
             enabled,
             upstreams,
@@ -2043,6 +2068,7 @@ impl UpstreamPayload {
             address: self.address,
             enabled: self.enabled,
             healthy: None,
+            weight: if self.weight == 0 { 1 } else { self.weight },
         })
     }
 }
@@ -2882,6 +2908,22 @@ impl HttpProxyState {
             return None;
         }
 
+        let weighted_pick = |list: &[Upstream], seed: u64| -> Upstream {
+            let total: u32 = list.iter().map(|u| u.weight.max(1)).sum();
+            if total == 0 {
+                return list[0].clone();
+            }
+            let mut acc = seed % total as u64;
+            for u in list {
+                let w = u.weight.max(1) as u64;
+                if acc < w {
+                    return u.clone();
+                }
+                acc = acc.saturating_sub(w);
+            }
+            list[0].clone()
+        };
+
         match &self.sticky {
             Some(StickyConfig {
                 strategy: StickyStrategy::Cookie,
@@ -2898,11 +2940,8 @@ impl HttpProxyState {
                     }
                 }
 
-                let idx = self.position.fetch_add(1, Ordering::Relaxed) % enabled.len();
-                let upstream = enabled
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_else(|| enabled[0].clone());
+                let seed = self.position.fetch_add(1, Ordering::Relaxed) as u64;
+                let upstream = weighted_pick(&enabled, seed);
 
                 let name = cookie_name.as_deref().unwrap_or("BALOR_STICKY").to_string();
                 let value = upstream.id.to_string();
@@ -2919,16 +2958,16 @@ impl HttpProxyState {
                 let addr = peer.ip();
                 let mut hasher = DefaultHasher::new();
                 Hash::hash(&addr, &mut hasher);
-                let idx = (hasher.finish() as usize) % enabled.len();
-                enabled.get(idx).cloned().map(|u| UpstreamSelection {
-                    upstream: u,
+                let seed = hasher.finish();
+                enabled.get(0).cloned().map(|_| UpstreamSelection {
+                    upstream: weighted_pick(&enabled, seed),
                     set_cookie: None,
                 })
             }
             None => {
-                let idx = self.position.fetch_add(1, Ordering::Relaxed) % enabled.len();
-                enabled.get(idx).cloned().map(|u| UpstreamSelection {
-                    upstream: u,
+                let seed = self.position.fetch_add(1, Ordering::Relaxed) as u64;
+                enabled.get(0).cloned().map(|_| UpstreamSelection {
+                    upstream: weighted_pick(&enabled, seed),
                     set_cookie: None,
                 })
             }
@@ -3368,8 +3407,6 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
-            | "te"
-            | "trailers"
             | "transfer-encoding"
             | "upgrade"
     )
@@ -4047,16 +4084,50 @@ async fn run_health_cycle(state: &AppState, client: &reqwest::Client) {
         }
         for upstream in all_upstreams {
             let ok = match listener.protocol {
-                Protocol::Http => check_http(client, &ensure_http_scheme(&upstream.address)).await,
-                Protocol::Tcp => check_tcp(&upstream.address).await,
+                Protocol::Http => {
+                    let probe = listener.health_probe.clone().unwrap_or_default();
+                    if let Some(script) = probe.script.clone() {
+                        run_health_script(&script, &upstream.address, "http").await
+                    } else {
+                        check_http(
+                            client,
+                            &ensure_http_scheme(&upstream.address),
+                            probe.path.clone(),
+                            probe.headers.clone(),
+                        )
+                        .await
+                    }
+                }
+                Protocol::Tcp => {
+                    if let Some(probe) = listener
+                        .health_probe
+                        .as_ref()
+                        .and_then(|p| p.script.clone())
+                    {
+                        run_health_script(&probe, &upstream.address, "tcp").await
+                    } else {
+                        check_tcp(&upstream.address).await
+                    }
+                }
             };
             state.health.write().insert(upstream.id, ok);
         }
     }
 }
 
-async fn check_http(client: &reqwest::Client, url: &str) -> bool {
-    let fut = client.get(url).timeout(Duration::from_secs(2)).send();
+async fn check_http(
+    client: &reqwest::Client,
+    base: &str,
+    path: Option<String>,
+    headers: Vec<(String, String)>,
+) -> bool {
+    let path = path.unwrap_or_else(|| "/".to_string());
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let mut req = client.get(&url);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let fut = req.timeout(Duration::from_secs(2)).send();
     match fut.await {
         Ok(resp) => resp.status().is_success(),
         Err(err) => {
@@ -4075,6 +4146,32 @@ async fn check_tcp(addr: &str) -> bool {
         }
         Err(_) => {
             warn!("TCP health check timed out for {addr}");
+            false
+        }
+    }
+}
+
+async fn run_health_script(script: &str, target: &str, protocol: &str) -> bool {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(script);
+    cmd.env("BALOR_HEALTH_TARGET", target);
+    cmd.env("BALOR_HEALTH_PROTO", protocol);
+    cmd.kill_on_drop(true);
+    match time::timeout(Duration::from_secs(5), cmd.status()).await {
+        Ok(Ok(status)) => {
+            if status.success() {
+                true
+            } else {
+                warn!("Health script exited non-zero for {target}: {status}");
+                false
+            }
+        }
+        Ok(Err(err)) => {
+            warn!("Health script failed for {target}: {err}");
+            false
+        }
+        Err(_) => {
+            warn!("Health script timed out for {target}");
             false
         }
     }

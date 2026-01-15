@@ -8,7 +8,7 @@ Rust-native L4/L7 load balancer with an Axum admin API and a Yew (WASM) control 
 
 **Author:** Eduard Gevorkyan (egevorky@arencloud.com)  
 **License:** Apache 2.0  
-**Current version:** UI 0.1.2 • API 0.1.2 • build `dev`
+**Current version:** UI 0.1.3 • API 0.1.3 • build `dev`
 
 ## Architecture
 
@@ -94,7 +94,7 @@ Environment knobs:
 - `GET/POST/PUT/DELETE /api/users` – RBAC user management (admin only).
 
 ## Notes
-- HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port. HTTP host routes pick from pools (pool selection is required per host); TCP listeners select a pool and the UI fills endpoints for you.
+- HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port. HTTP host routes pick from pools (pool selection is required per host); TCP listeners select a pool and the UI fills endpoints for you. Weighted upstreams are supported by adding an optional weight after a space, e.g., `api=http://10.0.0.2:8080 5` (defaults to 1).
 - State persists to `data/balor_state.json` on each change (path override via `BALOR_STATE_FILE`).
 - Background health checks run every ~5 seconds and mark upstreams up/down in the UI automatically.
 - HTTP listeners can terminate TLS via PEM cert/key paths; files are reloaded when they change. Multiple certificates on one port are supported via per-host SNI selection; a listener-level certificate acts as fallback.
@@ -128,4 +128,6 @@ Environment knobs:
 - ✅ Rate limiting: per-listener and per-host-route token-bucket limits (RPS + burst) with 429 + `Retry-After` on overage
 - ✅ ACME automation: HTTP-01 + Cloudflare/Route53/Generic (webhook) DNS-01 with periodic renewal and backoff retries. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
 - ✅ Listener bind flexibility: any valid `host:port` accepted in the UI/API for HTTP/TCP listeners; backend enforces socket-addr validity only.
+- ✅ gRPC pass-through: HTTP listeners preserve `TE: trailers`; point upstreams at your gRPC service.
+- ✅ Health probes: configurable HTTP health path/headers and optional probe scripts with timeouts/env to mark upstream health.
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes
