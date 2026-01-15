@@ -8,7 +8,7 @@ Rust-native L4/L7 load balancer with an Axum admin API and a Yew (WASM) control 
 
 **Author:** Eduard Gevorkyan (egevorky@arencloud.com)  
 **License:** Apache 2.0  
-**Current version:** UI 0.1.2 • API 0.1.2 • build `dev`
+**Current version:** UI 0.1.3 • API 0.1.3 • build `dev`
 
 ## Architecture
 
@@ -129,4 +129,5 @@ Environment knobs:
 - ✅ ACME automation: HTTP-01 + Cloudflare/Route53/Generic (webhook) DNS-01 with periodic renewal and backoff retries. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
 - ✅ Listener bind flexibility: any valid `host:port` accepted in the UI/API for HTTP/TCP listeners; backend enforces socket-addr validity only.
 - ✅ gRPC pass-through: HTTP listeners preserve `TE: trailers`; point upstreams at your gRPC service.
+- ✅ Health probes: configurable HTTP health path/headers and optional probe scripts with timeouts/env to mark upstream health.
 - ✅ Browser support: Chrome/Chromium and Firefox verified after Users/Metrics fixes
