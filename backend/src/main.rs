@@ -1371,13 +1371,14 @@ async fn update_trace_settings(
         ));
     }
     state.trace_sample.store(sample, Ordering::Relaxed);
-    {
+    let persist_result = {
         let mut store = state.store.write();
         store.trace_sample = sample;
-        if let Err(err) = persist_store(&state) {
-            warn!("failed to persist trace settings: {err}");
-            return Err(ApiError::Internal);
-        }
+        persist_store(&state)
+    };
+    if let Err(err) = persist_result {
+        warn!("failed to persist trace settings: {err}");
+        return Err(ApiError::Internal);
     }
     Ok(StatusCode::NO_CONTENT)
 }

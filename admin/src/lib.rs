@@ -2217,6 +2217,7 @@ fn app() -> Html {
                                                     trace_loading.set(false);
                                                     return;
                                                 }
+                                                // No-op if unchanged to avoid extra requests.
                                                 match api_set_trace_settings(val).await {
                                                     Ok(_) => trace_status.set(StatusLine::success(format!("Sampling set to {:.1}%", val as f64 / 100.0))),
                                                     Err(err) => handle_error(err),
