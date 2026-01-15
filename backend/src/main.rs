@@ -1365,6 +1365,11 @@ async fn update_trace_settings(
     Json(payload): Json<TraceSettings>,
 ) -> Result<StatusCode, ApiError> {
     let sample = payload.sample_permyriad.clamp(1, 10_000);
+    if sample == 0 {
+        return Err(ApiError::BadRequest(
+            "Sampling must be greater than 0 (min 0.1%)".into(),
+        ));
+    }
     state.trace_sample.store(sample, Ordering::Relaxed);
     {
         let mut store = state.store.write();

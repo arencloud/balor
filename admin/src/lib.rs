@@ -2188,7 +2188,7 @@ fn app() -> Html {
                                     }
                                     <input
                                         type="range"
-                                        min="0"
+                                        min="1"
                                         max="100"
                                         value={(trace_settings.sample_permyriad / 100).to_string()}
                                         oninput={{

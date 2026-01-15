@@ -92,6 +92,7 @@ Environment knobs:
 - `GET /api/certificates` – list uploaded/issued certs; `POST` uploads a PEM bundle.
 - `POST /api/login` / `POST /api/logout` – session tokens for the UI.
 - `GET/POST/PUT/DELETE /api/users` – RBAC user management (admin only).
+- `GET/PUT /api/logging` – get/set trace sampling (permyriad, min 1–max 10_000).
 
 ## Notes
 - HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port. HTTP host routes pick from pools (pool selection is required per host); TCP listeners select a pool and the UI fills endpoints for you. Weighted upstreams are supported by adding an optional weight after a space, e.g., `api=http://10.0.0.2:8080 5` (defaults to 1).
