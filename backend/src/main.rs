@@ -1364,12 +1364,15 @@ async fn update_trace_settings(
     State(state): State<AppState>,
     Json(payload): Json<TraceSettings>,
 ) -> Result<StatusCode, ApiError> {
-    let sample = payload.sample_permyriad.min(10_000);
+    let sample = payload.sample_permyriad.clamp(1, 10_000);
     state.trace_sample.store(sample, Ordering::Relaxed);
     {
         let mut store = state.store.write();
         store.trace_sample = sample;
-        persist_store(&state).map_err(|_| ApiError::Internal)?;
+        if let Err(err) = persist_store(&state) {
+            warn!("failed to persist trace settings: {err}");
+            return Err(ApiError::Internal);
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }

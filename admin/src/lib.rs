@@ -2212,6 +2212,11 @@ fn app() -> Html {
                                             spawn_local(async move {
                                                 trace_loading.set(true);
                                                 let val = trace_settings.sample_permyriad;
+                                                if val == 0 {
+                                                    trace_status.set(StatusLine::error("Sampling cannot be 0 (min 0.1%)"));
+                                                    trace_loading.set(false);
+                                                    return;
+                                                }
                                                 match api_set_trace_settings(val).await {
                                                     Ok(_) => trace_status.set(StatusLine::success(format!("Sampling set to {:.1}%", val as f64 / 100.0))),
                                                     Err(err) => handle_error(err),
