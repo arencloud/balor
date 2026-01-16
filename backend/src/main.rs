@@ -1199,12 +1199,16 @@ async fn request_standalone_acme(
     let acme = payload.acme.clone();
     tokio::spawn(async move {
         info!("ACME standalone issuance started for {host}");
-        if let Err(err) =
-            renew_standalone_job(state.clone(), host.clone(), Some(acme.clone())).await
-        {
-            warn!("Standalone ACME async job failed for {}: {err:?}", host);
+        let res = time::timeout(
+            Duration::from_secs(45),
+            renew_standalone_job(state.clone(), host.clone(), Some(acme.clone())),
+        )
+        .await;
+        match res {
+            Ok(Ok(_)) => info!("Standalone ACME issuance finished for {}", host),
+            Ok(Err(err)) => warn!("Standalone ACME async job failed for {}: {err:?}", host),
+            Err(_) => warn!("Standalone ACME async job timed out for {}", host),
         }
-        info!("ACME standalone issuance finished for {}", host);
     });
 
     info!(
