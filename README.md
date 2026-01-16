@@ -92,6 +92,7 @@ Environment knobs:
 - `GET /api/certificates` – list uploaded/issued certs; `POST` uploads a PEM bundle.
 - `POST /api/login` / `POST /api/logout` – session tokens for the UI.
 - `GET/POST/PUT/DELETE /api/users` – RBAC user management (admin only).
+- `GET/PUT /api/logging` – get/set trace sampling (permyriad, min 1–max 10_000).
 
 ## Notes
 - HTTP upstream addresses should include scheme (e.g., `http://127.0.0.1:7000`). TCP upstreams use host:port. HTTP host routes pick from pools (pool selection is required per host); TCP listeners select a pool and the UI fills endpoints for you. Weighted upstreams are supported by adding an optional weight after a space, e.g., `api=http://10.0.0.2:8080 5` (defaults to 1).
@@ -123,10 +124,10 @@ Environment knobs:
 - ✅ Certificates dashboard (manual PEM upload/download; ACME-issued certs register)
 - ✅ Version banner: UI/API/build version surfaced via `/api/version` and shown in the header
 - ✅ Metrics tab now includes latency quantiles (p50/p95/p99) derived from Prometheus buckets with quick visual cards
-- ✅ Logs tab (admin-only): live buffer view, level filter, and JSONL download/preview from the backend log store (retention + rotation)
+- ✅ Logs tab (admin-only): live buffer view, level filter, JSONL download/preview from the backend log store (retention + rotation), and hardened sampling controls (clamped 1–100% with safe persistence)
 - ✅ Admin console port/TLS controls: default bind `0.0.0.0:9443`, UI control to change port and pick a console cert (restart required)
 - ✅ Rate limiting: per-listener and per-host-route token-bucket limits (RPS + burst) with 429 + `Retry-After` on overage
-- ✅ ACME automation: HTTP-01 + Cloudflare/Route53/Generic (webhook) DNS-01 with periodic renewal and backoff retries. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance.
+- ✅ ACME automation: HTTP-01 + Cloudflare/Route53/Generic (webhook) DNS-01 with periodic renewal and backoff retries. ACME jobs (host-bound & standalone) persist with “valid until” dates; renew/edit/remove from UI; existing ACME certs are reused on edit to avoid needless re-issuance. Standalone issuance is timeout-guarded to prevent console hangs.
 - ✅ Listener bind flexibility: any valid `host:port` accepted in the UI/API for HTTP/TCP listeners; backend enforces socket-addr validity only.
 - ✅ gRPC pass-through: HTTP listeners preserve `TE: trailers`; point upstreams at your gRPC service.
 - ✅ Health probes: configurable HTTP health path/headers and optional probe scripts with timeouts/env to mark upstream health.

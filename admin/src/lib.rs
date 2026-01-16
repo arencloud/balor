@@ -429,6 +429,7 @@ fn app() -> Html {
     });
     let trace_status = use_state(StatusLine::clear);
     let trace_loading = use_state(|| false);
+    let acme_loading = use_state(|| false);
 
     let handle_error = {
         let status = status.clone();
@@ -2188,7 +2189,7 @@ fn app() -> Html {
                                     }
                                     <input
                                         type="range"
-                                        min="0"
+                                        min="1"
                                         max="100"
                                         value={(trace_settings.sample_permyriad / 100).to_string()}
                                         oninput={{
@@ -2209,12 +2210,24 @@ fn app() -> Html {
                                             let trace_status = trace_status.clone();
                                             let handle_error = handle_error.clone();
                                             let trace_loading = trace_loading.clone();
+                                            let current = trace_settings.sample_permyriad;
                                             spawn_local(async move {
                                                 trace_loading.set(true);
                                                 let val = trace_settings.sample_permyriad;
+                                                if val == 0 {
+                                                    trace_status.set(StatusLine::error("Sampling cannot be 0 (min 0.1%)"));
+                                                    trace_loading.set(false);
+                                                    return;
+                                                }
+                                                // No-op if unchanged to avoid extra requests.
                                                 match api_set_trace_settings(val).await {
                                                     Ok(_) => trace_status.set(StatusLine::success(format!("Sampling set to {:.1}%", val as f64 / 100.0))),
-                                                    Err(err) => handle_error(err),
+                                                    Err(err) => {
+                                                        trace_status.set(StatusLine::error("Sampling update failed"));
+                                                        // revert slider/state to previous value to avoid confusion
+                                                        trace_settings.set(TraceSettings{ sample_permyriad: current });
+                                                        handle_error(err);
+                                                    },
                                                 }
                                                 trace_loading.set(false);
                                             });
@@ -2323,8 +2336,11 @@ fn app() -> Html {
                                     let handle_error = handle_error.clone();
                                     let listeners_state = listeners.clone();
                                     let acme_jobs_state = acme_jobs.clone();
+                                    let acme_loading = acme_loading.clone();
                                     Callback::from(move |e: SubmitEvent| {
                                         e.prevent_default();
+                                        if *acme_loading { return; }
+                                        let acme_loading = acme_loading.clone();
                                         let form = (*acme_schedule).clone();
                                         if form.listener.is_empty() || form.host.is_empty() {
                                             acme_status.set(StatusLine::error("Select listener and host"));
@@ -2350,7 +2366,9 @@ fn app() -> Html {
                                         let handle_error = handle_error.clone();
                                         let listeners_state = listeners_state.clone();
                                         let acme_jobs_state = acme_jobs_state.clone();
+                                        let acme_loading = acme_loading.clone();
                                         spawn_local(async move {
+                                            acme_loading.set(true);
                                             match api_acme_schedule(listener_id, host, acme_cfg).await {
                                                 Ok(_) => {
                                                     let listeners_handle = listeners_state.clone();
@@ -2362,8 +2380,12 @@ fn app() -> Html {
                                                     }
                                                     acme_status.set(StatusLine::success("ACME scheduled"));
                                                 }
-                                                Err(err) => handle_error(err),
+                                                Err(err) => {
+                                                    acme_status.set(StatusLine::error("ACME schedule failed"));
+                                                    handle_error(err);
+                                                },
                                             }
+                                            acme_loading.set(false);
                                         });
                                     })
                                 }}>
@@ -2517,8 +2539,11 @@ fn app() -> Html {
                                     let acme_standalone = acme_standalone.clone();
                                     let acme_status = acme_status.clone();
                                     let handle_error = handle_error.clone();
+                                    let acme_loading = acme_loading.clone();
                                     Callback::from(move |e: SubmitEvent| {
                                         e.prevent_default();
+                                        if *acme_loading { return; }
+                                        let acme_loading = acme_loading.clone();
                                         let form = (*acme_standalone).clone();
                                         if form.host.is_empty() {
                                             acme_status.set(StatusLine::error("Host is required"));
@@ -2535,11 +2560,17 @@ fn app() -> Html {
                                         let host = form.host.clone();
                                         let acme_status = acme_status.clone();
                                         let handle_error = handle_error.clone();
+                                        let acme_loading = acme_loading.clone();
                                         spawn_local(async move {
+                                            acme_loading.set(true);
                                             match api_acme_request(host, acme_cfg).await {
-                                                Ok(_) => acme_status.set(StatusLine::success("Standalone ACME requested")),
-                                                Err(err) => handle_error(err),
+                                                Ok(_) => acme_status.set(StatusLine::success("Standalone ACME requested (async)")),
+                                                Err(err) => {
+                                                    acme_status.set(StatusLine::error("ACME request failed"));
+                                                    handle_error(err);
+                                                },
                                             }
+                                            acme_loading.set(false);
                                         });
                                     })
                                 }}>

@@ -63,7 +63,7 @@ use tokio::{
     fs, io,
     net::{TcpListener, TcpStream},
     process::Command,
-    task::JoinHandle,
+    task::{spawn_blocking, JoinHandle},
     time,
 };
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Role as WsRole, WebSocketStream};
@@ -1199,12 +1199,16 @@ async fn request_standalone_acme(
     let acme = payload.acme.clone();
     tokio::spawn(async move {
         info!("ACME standalone issuance started for {host}");
-        if let Err(err) =
-            renew_standalone_job(state.clone(), host.clone(), Some(acme.clone())).await
-        {
-            warn!("Standalone ACME async job failed for {}: {err:?}", host);
+        let res = time::timeout(
+            Duration::from_secs(45),
+            renew_standalone_job(state.clone(), host.clone(), Some(acme.clone())),
+        )
+        .await;
+        match res {
+            Ok(Ok(_)) => info!("Standalone ACME issuance finished for {}", host),
+            Ok(Err(err)) => warn!("Standalone ACME async job failed for {}: {err:?}", host),
+            Err(_) => warn!("Standalone ACME async job timed out for {}", host),
         }
-        info!("ACME standalone issuance finished for {}", host);
     });
 
     info!(
@@ -1364,13 +1368,38 @@ async fn update_trace_settings(
     State(state): State<AppState>,
     Json(payload): Json<TraceSettings>,
 ) -> Result<StatusCode, ApiError> {
-    let sample = payload.sample_permyriad.min(10_000);
+    let sample = payload.sample_permyriad.clamp(1, 10_000);
+    if sample == 0 {
+        return Err(ApiError::BadRequest(
+            "Sampling must be greater than 0 (min 0.1%)".into(),
+        ));
+    }
     state.trace_sample.store(sample, Ordering::Relaxed);
-    {
+    let store_path = state.state_path.clone();
+    let snapshot = {
         let mut store = state.store.write();
         store.trace_sample = sample;
-        persist_store(&state).map_err(|_| ApiError::Internal)?;
-    }
+        store.clone()
+    };
+    // Persist asynchronously to avoid blocking the core runtime.
+    let res = spawn_blocking(move || {
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&store_path, json)
+    })
+    .await
+    .map_err(|e| {
+        warn!("trace persist task join error: {e}");
+        ApiError::Internal
+    })?
+    .map_err(|e| {
+        warn!("failed to persist trace settings: {e}");
+        ApiError::Internal
+    })?;
+    let _ = res;
     Ok(StatusCode::NO_CONTENT)
 }
 
